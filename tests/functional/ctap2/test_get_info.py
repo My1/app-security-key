@@ -58,15 +58,11 @@ def test_get_info_options(client):
         assert info.options["rk"]
 
     assert info.options["up"]
-    assert "clientPin" in info.options
 
-    # Value depends on if a pin as been set.
-    # Upon boot, pin is never set as we don't have NVM
-    assert not info.options["clientPin"]
-
-    # The built-in UV is only offered while no client PIN is set, so it tracks the
-    # inverse of clientPin. Both states are covered by test_client_pin_reset().
-    assert info.options["uv"] == (not info.options["clientPin"])
+    # There is no FIDO client PIN: the device unlock PIN is the built-in user verification.
+    # "clientPin" is advertised only when built with PUAT_ADVERTISE_CLIENT_PIN (needed by Android)
+    assert info.options["uv"]
+    assert info.options["pinUvAuthToken"]
 
     # Default value options
     assert not info.options["plat"]
@@ -81,4 +77,5 @@ def test_get_info_max_msg_size(client):
 
 def test_get_info_pin_protocol(client):
     info = client.ctap2.info
-    assert info.pin_uv_protocols == [1]
+    # In order of preference
+    assert info.pin_uv_protocols == [2, 1]

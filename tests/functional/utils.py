@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass
 from enum import Enum, auto
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+from fido2.ctap2.pin import ClientPin
 from fido2.cose import ES256
 from fido2.ctap2.base import args, AttestationResponse
 from fido2.utils import sha256
@@ -80,7 +81,7 @@ def generate_make_credentials_params(client,
                                      rk: Optional[bool] = None,
                                      uv: Optional[bool] = None,
                                      key_params=None,
-                                     pin: Optional[bytes] = None,
+                                     puat: bool = False,
                                      pin_uv_param: Optional[bytes] = None,
                                      ref: Optional[int] = None,
                                      exclude_list: Optional[List] = None,
@@ -122,9 +123,11 @@ def generate_make_credentials_params(client,
     params = MakeCredentialArguments(client_data_hash, rp, user, key_params,
                                      exclude_list, extensions, options)
 
-    if pin is not None or pin_uv_param is not None:
-        if pin:
-            token = client.client_pin.get_pin_token(pin)
+    if puat or pin_uv_param is not None:
+        if puat:
+            # Request a pinUvAuthToken through built-in UV, bound to this RP, and use it
+            token = client.client_pin.get_uv_token(ClientPin.PERMISSION.MAKE_CREDENTIAL,
+                                                   rp["id"])
             params.pin_uv_param = client.client_pin.protocol.authenticate(token, client_data_hash)
         else:
             params.pin_uv_param = pin_uv_param

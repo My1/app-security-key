@@ -206,7 +206,10 @@ static int compute_hmacSecret_output(uint8_t **output, uint32_t *outputLen, uint
     return ERROR_NONE;
 }
 
-static int build_authData(uint8_t *buffer, uint32_t bufferLength, uint32_t *authDataLen) {
+static int build_authData(uint8_t *buffer,
+                          uint32_t bufferLength,
+                          uint32_t *authDataLen,
+                          bool noCounter) {
     ctap2_assert_data_t *ctap2AssertData = globals_get_ctap2_assert_data();
     uint16_t offset = 0;
     cbipEncoder_t encoder;
@@ -229,8 +232,13 @@ static int build_authData(uint8_t *buffer, uint32_t bufferLength, uint32_t *auth
     }
     offset++;
 
-    // signCount
-    offset += config_increase_and_get_authentification_counter(buffer + offset);
+    // signCount: 0 for credentials flagged noCounter, the global counter for older credentials
+    if (noCounter) {
+        memset(buffer + offset, 0, 4);
+        offset += 4;
+    } else {
+        offset += config_increase_and_get_authentification_counter(buffer + offset);
+    }
 
     // attestedCredentialData - not managed
 
@@ -418,7 +426,10 @@ static int build_and_encode_getAssertion_response(uint8_t *buffer,
     uint8_t mapSize = 3;
     uint32_t dataLen;
     // Build authenticator data
-    int status = build_authData(shared_ctx.sharedBuffer, sizeof(shared_ctx.sharedBuffer), &dataLen);
+    int status = build_authData(shared_ctx.sharedBuffer,
+                                sizeof(shared_ctx.sharedBuffer),
+                                &dataLen,
+                                credData->noCounter);
 
     if (status != ERROR_NONE) {
         return status;

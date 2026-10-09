@@ -36,9 +36,17 @@
 #define TAG_HANDLE_USERID         4
 #define TAG_HANDLE_USERNAME       5
 
-#define CTAP2_HANDLE_VERSION 1
+// Handle versions (inner version, inside the encrypted CBOR; not to be confused with the
+// CREDENTIAL_VERSION_* byte at the start of the credId):
+// - 1: original format.
+// - 2: adds the FLAG_NO_COUNTER flag. Written for every new credential, and rejected by apps that
+//      predate it (they only accept version 1), so a version 2 credential fails cleanly on an old
+//      app instead of silently falling back to a signature counter the RP has never seen.
+#define CTAP2_HANDLE_VERSION_1 1
+#define CTAP2_HANDLE_VERSION_2 2
 
-#define FLAG_RK 0x01
+#define FLAG_RK         0x01
+#define FLAG_NO_COUNTER 0x02
 
 static int credential_encode(credential_data_t *credData,
                              uint8_t *buffer,
@@ -59,13 +67,16 @@ static int credential_encode(credential_data_t *credData,
     if (credData->residentKey) {
         flags |= FLAG_RK;
     }
+    if (credData->noCounter) {
+        flags |= FLAG_NO_COUNTER;
+    }
 
     cbip_encoder_init(&encoder, buffer, bufferLen);
 
     cbip_add_map_header(&encoder, mapSize);
 
     cbip_add_int(&encoder, TAG_HANDLE_VERSION);
-    cbip_add_int(&encoder, CTAP2_HANDLE_VERSION);
+    cbip_add_int(&encoder, CTAP2_HANDLE_VERSION_2);
 
     cbip_add_int(&encoder, TAG_HANDLE_FLAGS);
     cbip_add_int(&encoder, flags);
@@ -99,6 +110,7 @@ int credential_decode(credential_data_t *credData,
     cbipDecoder_t decoder;
     cbipItem_t mapItem;
     int tmp;
+    int version;
 
     memset(credData, 0, sizeof(credential_data_t));
 
@@ -120,10 +132,11 @@ int credential_decode(credential_data_t *credData,
         PRINTF("Invalid credential version\n");
         return -1;
     }
-    if (tmp != CTAP2_HANDLE_VERSION) {
-        PRINTF("Invalid credential version %d / %d", tmp, CTAP2_HANDLE_VERSION);
+    if ((tmp != CTAP2_HANDLE_VERSION_1) && (tmp != CTAP2_HANDLE_VERSION_2)) {
+        PRINTF("Invalid credential version %d\n", tmp);
         return -1;
     }
+    version = tmp;
 
     // Check and retrieve flags
     status = cbiph_get_map_key_int(&decoder, &mapItem, TAG_HANDLE_FLAGS, &tmp);
@@ -131,10 +144,21 @@ int credential_decode(credential_data_t *credData,
         PRINTF("Invalid credential flags\n");
         return -1;
     }
-    if (tmp == FLAG_RK) {
-        credData->residentKey = 1;
-    } else if (tmp != 0) {
-        PRINTF("Invalid credential flags %d\n", tmp);
+    if (version == CTAP2_HANDLE_VERSION_1) {
+        // Original behavior: only the resident key flag exists, and a credential created before
+        // the zero counter feature keeps using the signature counter.
+        if (tmp == FLAG_RK) {
+            credData->residentKey = 1;
+        } else if (tmp != 0) {
+            PRINTF("Invalid credential flags %d\n", tmp);
+        }
+    } else {
+        if ((tmp & ~(FLAG_RK | FLAG_NO_COUNTER)) != 0) {
+            PRINTF("Invalid credential flags %d\n", tmp);
+            return -1;
+        }
+        credData->residentKey = (tmp & FLAG_RK) ? 1 : 0;
+        credData->noCounter = (tmp & FLAG_NO_COUNTER) ? 1 : 0;
     }
 
     if (fullCredentials) {

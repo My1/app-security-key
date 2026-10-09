@@ -60,7 +60,6 @@
 #define OPTION_RESIDENT_KEY      "rk"
 #define OPTION_USER_PRESENCE     "up"
 #define OPTION_USER_VERIFICATION "uv"
-#define OPTION_CLIENT_PIN        "clientPin"
 
 #define CREDENTIAL_DESCRIPTOR_ALG         "alg"
 #define CREDENTIAL_DESCRIPTOR_TYPE        "type"

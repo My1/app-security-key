@@ -84,6 +84,9 @@ typedef struct credential_data_s {
     char *userStr;
     uint32_t userStrLen;
     uint8_t residentKey;
+    // Set on credentials that never report a signature counter (always 0). Only credentials with
+    // handle version 2 can carry it, older (version 1) credentials always use the counter.
+    uint8_t noCounter;
 } credential_data_t;
 
 /**

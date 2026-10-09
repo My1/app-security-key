@@ -146,8 +146,10 @@ static int build_makeCred_authData(uint8_t *nonce, uint8_t *buffer, uint32_t buf
     }
     offset++;
 
-    // Add Counter
-    config_increase_and_get_authentification_counter(buffer + offset);
+    // Add Counter: always 0 for new credentials, which are flagged as such (see noCounter below).
+    // A global counter seeded from a build / HSM timestamp is meaningless once the seed is
+    // restored on another device, and can overflow the signed 32 bits some RPs store it in.
+    memset(buffer + offset, 0, 4);
     offset += 4;
 
     // Add AAGUID
@@ -162,6 +164,7 @@ static int build_makeCred_authData(uint8_t *nonce, uint8_t *buffer, uint32_t buf
     ctap2CredentailData.userStrLen = ctap2RegisterData->userStrLen;
     ctap2CredentailData.coseAlgorithm = ctap2RegisterData->coseAlgorithm;
     ctap2CredentailData.residentKey = ctap2RegisterData->residentKey;
+    ctap2CredentailData.noCounter = 1;
     status = credential_wrap(ctap2RegisterData->rpIdHash,
                              nonce,
                              &ctap2CredentailData,
