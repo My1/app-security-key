@@ -36,15 +36,24 @@
 #define RP_ID_HASH_SIZE             CX_SHA256_SIZE
 #define CRED_RANDOM_SIZE            32
 #define HMAC_SECRET_SALT_SIZE       32
-#define PIN_HASH_SIZE               16
-#define AUTH_TOKEN_SIZE             16
-#define AUTH_TOKEN_PROT_V1_ENC_SIZE AUTH_TOKEN_SIZE
-#define AUTH_TOKEN_MAX_ENC_SIZE     AUTH_TOKEN_PROT_V1_ENC_SIZE
-#define AUTH_PROT_V1_SIZE           16
-#define SHARED_SECRET_V1_SIZE       32
-#define SECRET_HMAC_KEY_SIZE        32
-#define SECRET_AES_KEY_SIZE         32
-#define SHARED_SECRET_MAX_SIZE      SHARED_SECRET_V1_SIZE
+
+// PIN/UV auth protocol parameters (FIDO2.1 spec, section 6.5.6 / 6.5.7)
+#define AUTH_TOKEN_V1_SIZE      16
+#define AUTH_TOKEN_V2_SIZE      32
+#define AUTH_TOKEN_MAX_SIZE     AUTH_TOKEN_V2_SIZE
+#define AUTH_PROT_V1_SIZE       16  // authenticate() output, protocol 1: LEFT(HMAC, 16)
+#define AUTH_PROT_V2_SIZE       32  // authenticate() output, protocol 2: full HMAC
+#define AES_IV_SIZE             16
+#define AUTH_TOKEN_MAX_ENC_SIZE (AES_IV_SIZE + AUTH_TOKEN_MAX_SIZE)
+#define SECRET_HMAC_KEY_SIZE    32
+#define SECRET_AES_KEY_SIZE     32
+// Protocol 1: SHA-256(z), used as both HMAC and AES key (32 bytes).
+// Protocol 2: HMAC key (32 bytes) || AES key (32 bytes).
+#define SHARED_SECRET_V1_SIZE  32
+#define SHARED_SECRET_V2_SIZE  (SECRET_HMAC_KEY_SIZE + SECRET_AES_KEY_SIZE)
+#define SHARED_SECRET_MAX_SIZE SHARED_SECRET_V2_SIZE
+// Largest plaintext handled by encrypt()/decrypt() (hmac-secret: two 32 bytes salts)
+#define PIN_UV_CRYPT_MAX_SIZE 64
 
 #define KEY_RP_ID "id"
 
@@ -87,6 +96,17 @@
 #define AUTHDATA_FLAG_EXTENSION_DATA_PRESENT           0x80
 
 #define PIN_PROTOCOL_VERSION_V1 1
+#define PIN_PROTOCOL_VERSION_V2 2
+
+// pinUvAuthToken permissions (FIDO2.1 spec, section 6.5.5.7)
+#define PUAT_PERM_MC 0x01  // authenticatorMakeCredential
+#define PUAT_PERM_GA 0x02  // authenticatorGetAssertion
+// Permissions this authenticator can grant. cm / be / lbw / acfg are not implemented.
+#define PUAT_PERM_SUPPORTED (PUAT_PERM_MC | PUAT_PERM_GA)
+
+#ifndef ERROR_UNAUTHORIZED_PERMISSION
+#define ERROR_UNAUTHORIZED_PERMISSION 0x40  // CTAP2_ERR_UNAUTHORIZED_PERMISSION
+#endif
 
 #define FLAG_EXTENSION_HMAC_SECRET 0x01
 
@@ -149,7 +169,20 @@ int ctap2_client_pin_encrypt(int protocol,
 /*        Pin Auth Token helpers          */
 /******************************************/
 
+// Returns true if `protocol` is a PIN/UV auth protocol implemented by this app.
+bool ctap2_client_pin_protocol_supported(int protocol);
+
+// Removes a permission from the current pinUvAuthToken (no effect without a token).
+void ctap2_client_pin_clear_permission(uint8_t permission);
+
+// Verifies a pinUvAuthParam against the current pinUvAuthToken.
+//
+// On success the token is known to be genuine, to carry `permission` and to be usable for
+// `rpIdHash`; the permission is then consumed (a token is good for one makeCredential and/or one
+// getAssertion). Returns ERROR_NONE on success, ERROR_PIN_AUTH_INVALID otherwise.
 int ctap2_client_pin_verify_auth_token(int protocol,
+                                       uint8_t permission,
+                                       const uint8_t *rpIdHash,
                                        const uint8_t *msg,
                                        uint32_t msgLength,
                                        const uint8_t *signature,

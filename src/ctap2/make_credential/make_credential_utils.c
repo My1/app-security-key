@@ -138,7 +138,7 @@ static int build_makeCred_authData(uint8_t *nonce, uint8_t *buffer, uint32_t buf
     offset += CX_SHA256_SIZE;
 
     buffer[offset] = AUTHDATA_FLAG_USER_PRESENCE | AUTHDATA_FLAG_ATTESTED_CREDENTIAL_DATA_PRESENT;
-    if (ctap2RegisterData->pinRequired || ctap2RegisterData->clientPinAuthenticated) {
+    if (ctap2RegisterData->pinRequired || ctap2RegisterData->pinUvAuthenticated) {
         buffer[offset] |= AUTHDATA_FLAG_USER_VERIFIED;
     }
     if (ctap2RegisterData->extensions != 0) {

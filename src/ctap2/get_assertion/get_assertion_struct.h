@@ -46,7 +46,7 @@ typedef struct ctap2_assert_data_s {
     uint8_t pinRequired;   // set if uv is set
     uint8_t pinPresented;  // set if the PIN request was acknowledged by the user
     uint8_t
-        clientPinAuthenticated;    // set if a standard FIDO client PIN authentication was performed
+        pinUvAuthenticated;    // set if a valid pinUvAuthParam was provided
     uint8_t userPresenceRequired;  // set if up is set
     uint8_t extensions;            // extensions flags as a bitmask
 

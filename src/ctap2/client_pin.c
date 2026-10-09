@@ -16,6 +16,7 @@
 *   limitations under the License.
 ********************************************************************************/
 
+#include <string.h>
 #include <os.h>
 #include <cx.h>
 #include <ledger_assert.h>
@@ -28,77 +29,69 @@
 #include "crypto.h"
 #include "globals.h"
 
+/*
+ * authenticatorClientPIN, reduced to what a PIN-less, built-in-UV authenticator needs.
+ *
+ * The device unlock PIN is this authenticator's user verification, so there is no FIDO client PIN
+ * (no setPIN / changePIN / getPinToken / getPinRetries / getPinUvAuthTokenUsingPin...). What
+ * remains is the PIN/UV auth protocol machinery (shared by hmac-secret) and the issuance of
+ * pinUvAuthTokens through built-in UV.
+ */
+
 #define TAG_PIN_PROTOCOL  0x01
 #define TAG_SUBCOMMAND    0x02
 #define TAG_KEY_AGREEMENT 0x03
-#define TAG_PIN_AUTH      0x04
-#define TAG_NEW_PIN_ENC   0x05
-#define TAG_PIN_HASH_ENC  0x06
+#define TAG_PERMISSIONS   0x09
+#define TAG_RP_ID         0x0A
 
 #define TAG_RESP_KEY_AGREEMENT 0x01
 #define TAG_RESP_PIN_TOKEN     0x02
-#define TAG_RESP_RETRIES       0x03
+#define TAG_RESP_UV_RETRIES    0x05
 
-#define SUBCOMMAND_GET_PIN_RETRIES   0x01
 #define SUBCOMMAND_GET_KEY_AGREEMENT 0x02
-#define SUBCOMMAND_SET_PIN           0x03
-#define SUBCOMMAND_CHANGE_PIN        0x04
-#define SUBCOMMAND_GET_PIN_TOKEN     0x05
+// getPinUvAuthTokenUsingUvWithPermissions
+#define SUBCOMMAND_GET_UV_TOKEN      0x06
+#define SUBCOMMAND_GET_UV_RETRIES    0x07
 
-#define MIN_PIN_LENGTH                  4
-#define MAX_PIN_LENGTH                  64
-#define MAX_TRANSIENT_PIN_AUTH_FAILURES 3
+// Built-in UV is the device unlock PIN: it is managed (and rate limited) by the OS, never fails
+// here, and has no retry counter of its own. Report a constant, non-zero value so platforms
+// never consider UV blocked.
+#define UV_RETRIES_NOMINAL 5
 
-static uint8_t authToken[AUTH_TOKEN_SIZE];
-static uint8_t authTokenProtocol = 0;
-static bool authTokeninUse;
+#define HKDF_INFO_HMAC_KEY "CTAP2 HMAC key"
+#define HKDF_INFO_AES_KEY  "CTAP2 AES key"
 
-static uint8_t ctap2TransientPinAuths;
+typedef struct {
+    bool inUse;
+    uint8_t protocol;
+    uint8_t length;
+    uint8_t value[AUTH_TOKEN_MAX_SIZE];
+    uint8_t permissions;
+    bool hasRpId;
+    uint8_t rpIdHash[RP_ID_HASH_SIZE];
+} pin_uv_auth_token_t;
+
+static pin_uv_auth_token_t authToken;
 
 static cx_ecfp_private_key_t ctap2KeyAgreement;
 
-/******************************************/
-/*        Context check helpers           */
-/******************************************/
-#define CHECK_PIN_SET()                                       \
-    do {                                                      \
-        if (!N_u2f.pinSet) {                                  \
-            PRINTF("PIN not set\n");                          \
-            send_cbor_error(service, ERROR_PIN_AUTH_INVALID); \
-            return;                                           \
-        }                                                     \
-    } while (0)
-
-#define CHECK_PIN_NOT_SET()                                   \
-    do {                                                      \
-        if (N_u2f.pinSet) {                                   \
-            PRINTF("PIN already set\n");                      \
-            send_cbor_error(service, ERROR_PIN_AUTH_INVALID); \
-            return;                                           \
-        }                                                     \
-    } while (0)
-
-#define CHECK_PIN_RETRIES()                              \
-    do {                                                 \
-        if (N_u2f.pinRetries == 0) {                     \
-            PRINTF("PIN blocked\n");                     \
-            send_cbor_error(service, ERROR_PIN_BLOCKED); \
-            return;                                      \
-        }                                                \
-    } while (0)
-
-#define CHECK_PIN_TRANSIENT_FAILURE()                                    \
-    do {                                                                 \
-        if (ctap2TransientPinAuths >= MAX_TRANSIENT_PIN_AUTH_FAILURES) { \
-            PRINTF("PIN authentication blocked temporarily\n");          \
-            send_cbor_error(service, ERROR_PIN_AUTH_BLOCKED);            \
-            return;                                                      \
-        }                                                                \
-    } while (0)
+// Scratch buffers kept out of the stack on purpose: this app has little stack headroom, and
+// static functions called once get inlined, which would put all of these in the frame of
+// ctap2_client_pin_handle() for every subcommand. Only one CTAP2 command is processed at a
+// time and every user wipes them with explicit_bzero() after use.
+static uint8_t cryptScratch[PIN_UV_CRYPT_MAX_SIZE];
+static cx_aes_key_t cryptAesKey;
+static uint8_t uvSharedSecret[SHARED_SECRET_MAX_SIZE];
+static uint8_t uvTokenEnc[AUTH_TOKEN_MAX_ENC_SIZE];
 
 /******************************************/
 /*     PIN/UV Auth Protocol functions     */
 /******************************************/
+
+bool ctap2_client_pin_protocol_supported(int protocol) {
+    return (protocol == PIN_PROTOCOL_VERSION_V1) || (protocol == PIN_PROTOCOL_VERSION_V2);
+}
+
 // Correspond to FIDO2.1 spec PIN/UV Auth Protocol regenerate() operation
 int ctap2_client_pin_regenerate(void) {
     cx_ecfp_public_key_t publicKey;
@@ -110,6 +103,29 @@ int ctap2_client_pin_regenerate(void) {
     return 0;
 }
 
+// Single block HKDF-SHA-256 (RFC 5869) with a 32 bytes zero salt and a 32 bytes output, as
+// required by PIN/UV auth protocol 2: HKDF(salt = 0^32, IKM = z, L = 32, info).
+static void hkdf_sha256_32(const uint8_t *ikm,
+                           uint32_t ikmLen,
+                           const char *info,
+                           uint8_t out[CX_SHA256_SIZE]) {
+    uint8_t salt[CX_SHA256_SIZE] = {0};
+    uint8_t prk[CX_SHA256_SIZE];
+    uint8_t expandIn[sizeof(HKDF_INFO_HMAC_KEY) + 1];  // longest info string + counter byte
+    size_t infoLen = strlen(info);
+
+    LEDGER_ASSERT(infoLen + 1 <= sizeof(expandIn), "HKDF info too long");
+
+    // Extract
+    cx_hmac_sha256(salt, sizeof(salt), ikm, ikmLen, prk, sizeof(prk));
+    // Expand, T(1) = HMAC(PRK, info || 0x01)
+    memcpy(expandIn, info, infoLen);
+    expandIn[infoLen] = 0x01;
+    cx_hmac_sha256(prk, sizeof(prk), expandIn, infoLen + 1, out, CX_SHA256_SIZE);
+
+    explicit_bzero(prk, sizeof(prk));
+}
+
 // Correspond to FIDO2.1 spec PIN/UV Auth Protocol decapsulate() operation
 int ctap2_client_pin_decapsulate(int protocol,
                                  cbipDecoder_t *decoder,
@@ -119,7 +135,11 @@ int ctap2_client_pin_decapsulate(int protocol,
     int status;
     cbipItem_t keyMapItem;
     cx_ecfp_public_key_t publicKey;
-    uint8_t tmp[32];
+    uint8_t z[32];
+
+    if (!ctap2_client_pin_protocol_supported(protocol)) {
+        return ERROR_INVALID_PAR;
+    }
 
     GET_MAP_KEY_ITEM(decoder, mapItem, key, keyMapItem, cbipMap);
 
@@ -132,19 +152,20 @@ int ctap2_client_pin_decapsulate(int protocol,
                               CX_ECDH_X,
                               publicKey.W,
                               sizeof(publicKey.W),
-                              tmp,
-                              sizeof(tmp));
+                              z,
+                              sizeof(z));
     if (status != CX_OK) {
         PRINTF("ECDH failed\n");
         return ERROR_OTHER;
     }
 
     if (protocol == PIN_PROTOCOL_VERSION_V1) {
-        cx_hash_sha256(tmp, sizeof(tmp), sharedSecret, SHARED_SECRET_V1_SIZE);
-        PRINTF("Shared secret %.*H\n", SHARED_SECRET_V1_SIZE, sharedSecret);
+        cx_hash_sha256(z, sizeof(z), sharedSecret, SHARED_SECRET_V1_SIZE);
     } else {
-        return ERROR_INVALID_PAR;
+        hkdf_sha256_32(z, sizeof(z), HKDF_INFO_HMAC_KEY, sharedSecret);
+        hkdf_sha256_32(z, sizeof(z), HKDF_INFO_AES_KEY, sharedSecret + SECRET_HMAC_KEY_SIZE);
     }
+    explicit_bzero(z, sizeof(z));
 
     return ERROR_NONE;
 }
@@ -163,11 +184,13 @@ bool ctap2_client_pin_verify(int protocol,
 
     if (protocol == PIN_PROTOCOL_VERSION_V1) {
         if (signatureLength != AUTH_PROT_V1_SIZE) {
-            // ERROR_INVALID_CBOR
+            return false;
+        }
+    } else if (protocol == PIN_PROTOCOL_VERSION_V2) {
+        if (signatureLength != AUTH_PROT_V2_SIZE) {
             return false;
         }
     } else {
-        // ERROR_INVALID_PAR;
         return false;
     }
 
@@ -197,8 +220,6 @@ bool ctap2_client_pin_verify(int protocol,
     }
 
     if (!crypto_compare(signature, hmacValue, signatureLength)) {
-        PRINTF("signature %.*H\n", signatureLength, signature);
-        PRINTF("computed sign %.*H\n", signatureLength, hmacValue);
         explicit_bzero(hmacValue, sizeof(hmacValue));
         return false;
     }
@@ -208,122 +229,160 @@ bool ctap2_client_pin_verify(int protocol,
 }
 
 // Correspond to FIDO2.1 spec PIN/UV Auth Protocol decrypt() operation
+//
+// Protocol 1: AES-256-CBC, zero IV.
+// Protocol 2: AES-256-CBC, the IV is the first 16 bytes of the input.
+// `dataIn` and `dataOut` may be the same buffer.
 int ctap2_client_pin_decrypt(int protocol,
                              const uint8_t *sharedSecret,
                              const uint8_t *dataIn,
                              uint32_t dataInLength,
                              uint8_t *dataOut,
                              uint32_t *dataOutLength) {
+    uint8_t iv[AES_IV_SIZE] = {0};
+    uint8_t *tmp = cryptScratch;
     const uint8_t *aesKey;
-    const uint8_t *iv;
-    uint8_t ivLength;
     const uint8_t *data;
     uint32_t dataLength;
-    cx_aes_key_t key;
-
-    if ((dataInLength % CX_AES_BLOCK_SIZE) != 0) {
-        return -1;
-    }
-    *dataOutLength = dataInLength;
+    uint32_t outLength;
+    cx_aes_key_t *key = &cryptAesKey;
+    int ret = -1;
 
     if (protocol == PIN_PROTOCOL_VERSION_V1) {
         aesKey = sharedSecret;
-        iv = NULL;
-        ivLength = 0;
         data = dataIn;
         dataLength = dataInLength;
+    } else if (protocol == PIN_PROTOCOL_VERSION_V2) {
+        if (dataInLength < 2 * AES_IV_SIZE) {
+            return -1;
+        }
+        aesKey = sharedSecret + SECRET_HMAC_KEY_SIZE;
+        memcpy(iv, dataIn, AES_IV_SIZE);
+        data = dataIn + AES_IV_SIZE;
+        dataLength = dataInLength - AES_IV_SIZE;
     } else {
         return -1;
     }
 
-    if (cx_aes_init_key_no_throw(aesKey, SECRET_AES_KEY_SIZE, &key) != CX_OK) {
-        return -1;
-    }
-    if (cx_aes_iv_no_throw(&key,
-                           CX_LAST | CX_DECRYPT | CX_PAD_NONE | CX_CHAIN_CBC,
-                           iv,
-                           ivLength,
-                           data,
-                           dataLength,
-                           dataOut,
-                           dataOutLength) != CX_OK) {
+    if ((dataLength % CX_AES_BLOCK_SIZE) != 0 || dataLength > sizeof(cryptScratch)) {
         return -1;
     }
 
-    return 0;
+    // Decrypt out of place, so that the IV prefix of protocol 2 can't overlap the output
+    outLength = sizeof(cryptScratch);
+    if (cx_aes_init_key_no_throw(aesKey, SECRET_AES_KEY_SIZE, key) != CX_OK) {
+        goto end;
+    }
+    if (cx_aes_iv_no_throw(key,
+                           CX_LAST | CX_DECRYPT | CX_PAD_NONE | CX_CHAIN_CBC,
+                           iv,
+                           sizeof(iv),
+                           data,
+                           dataLength,
+                           tmp,
+                           &outLength) != CX_OK) {
+        goto end;
+    }
+
+    memcpy(dataOut, tmp, outLength);
+    *dataOutLength = outLength;
+    ret = 0;
+
+end:
+    explicit_bzero(cryptScratch, sizeof(cryptScratch));
+    explicit_bzero(&cryptAesKey, sizeof(cryptAesKey));
+    return ret;
 }
 
 // Correspond to FIDO2.1 spec PIN/UV Auth Protocol encrypt() operation
+//
+// Protocol 1: AES-256-CBC, zero IV.
+// Protocol 2: AES-256-CBC, random IV which is prepended to the output (dataOut is 16 bytes longer
+//             than dataIn).
+// `dataIn` and `dataOut` may be the same buffer.
 int ctap2_client_pin_encrypt(int protocol,
                              const uint8_t *sharedSecret,
                              const uint8_t *dataIn,
                              uint32_t dataInLength,
                              uint8_t *dataOut,
                              uint32_t *dataOutLength) {
+    uint8_t iv[AES_IV_SIZE] = {0};
+    uint8_t *tmp = cryptScratch;
     const uint8_t *aesKey;
-    uint8_t *iv;
-    uint8_t ivLength;
-    uint8_t *data;
-    cx_aes_key_t key;
-    *dataOutLength = dataInLength;
+    uint32_t outLength;
+    cx_aes_key_t *key = &cryptAesKey;
+    int ret = -1;
 
-    if ((dataInLength % CX_AES_BLOCK_SIZE) != 0) {
+    if ((dataInLength % CX_AES_BLOCK_SIZE) != 0 || dataInLength > sizeof(cryptScratch)) {
         return -1;
     }
 
     if (protocol == PIN_PROTOCOL_VERSION_V1) {
         aesKey = sharedSecret;
-        iv = NULL;
-        ivLength = 0;
-        data = dataOut;
+    } else if (protocol == PIN_PROTOCOL_VERSION_V2) {
+        aesKey = sharedSecret + SECRET_HMAC_KEY_SIZE;
+        cx_rng_no_throw(iv, sizeof(iv));
     } else {
         return -1;
     }
 
-    if (cx_aes_init_key_no_throw(aesKey, SECRET_AES_KEY_SIZE, &key) != CX_OK) {
-        return -1;
+    outLength = sizeof(cryptScratch);
+    if (cx_aes_init_key_no_throw(aesKey, SECRET_AES_KEY_SIZE, key) != CX_OK) {
+        goto end;
     }
-    if (cx_aes_iv_no_throw(&key,
+    if (cx_aes_iv_no_throw(key,
                            CX_LAST | CX_ENCRYPT | CX_PAD_NONE | CX_CHAIN_CBC,
                            iv,
-                           ivLength,
+                           sizeof(iv),
                            dataIn,
                            dataInLength,
-                           data,
-                           dataOutLength) != CX_OK) {
-        return -1;
+                           tmp,
+                           &outLength) != CX_OK) {
+        goto end;
     }
 
-    return 0;
+    if (protocol == PIN_PROTOCOL_VERSION_V2) {
+        memcpy(dataOut, iv, AES_IV_SIZE);
+        memcpy(dataOut + AES_IV_SIZE, tmp, outLength);
+        *dataOutLength = AES_IV_SIZE + outLength;
+    } else {
+        memcpy(dataOut, tmp, outLength);
+        *dataOutLength = outLength;
+    }
+    ret = 0;
+
+end:
+    explicit_bzero(cryptScratch, sizeof(cryptScratch));
+    explicit_bzero(&cryptAesKey, sizeof(cryptAesKey));
+    return ret;
 }
 
 /******************************************/
-/*   Pin Uv Auth Token Protocol helpers   */
+/*          pinUvAuthToken state          */
 /******************************************/
 
-static bool is_token_valid(void) {
-    if (!authTokeninUse) {
-        return false;
-    }
-    return true;
+static void invalidate_token(void) {
+    explicit_bzero(&authToken, sizeof(authToken));
+}
+
+void ctap2_client_pin_clear_permission(uint8_t permission) {
+    authToken.permissions &= ~permission;
 }
 
 int ctap2_client_pin_verify_auth_token(int protocol,
+                                       uint8_t permission,
+                                       const uint8_t *rpIdHash,
                                        const uint8_t *msg,
                                        uint32_t msgLength,
                                        const uint8_t *signature,
                                        uint32_t signatureLength) {
-    if (!is_token_valid()) {
+    if (!authToken.inUse || (protocol != authToken.protocol)) {
         return ERROR_PIN_AUTH_INVALID;
     }
 
-    if (protocol != authTokenProtocol) {
-        return ERROR_INVALID_PAR;
-    }
-
     if (!ctap2_client_pin_verify(protocol,
-                                 authToken,
-                                 AUTH_TOKEN_SIZE,
+                                 authToken.value,
+                                 authToken.length,
                                  msg,
                                  msgLength,
                                  NULL,
@@ -333,138 +392,39 @@ int ctap2_client_pin_verify_auth_token(int protocol,
         return ERROR_PIN_AUTH_INVALID;
     }
 
-    return ERROR_NONE;
-}
-
-/******************************************/
-/*         Pin handling helpers           */
-/******************************************/
-static void handle_store_pin(u2f_service_t *service,
-                             int protocol,
-                             const uint8_t *sharedSecret,
-                             uint8_t *pinEnc,
-                             uint32_t pinEncLen) {
-    uint32_t pinLenOut;
-
-    // Decrypt pin in place
-    if (ctap2_client_pin_decrypt(protocol, sharedSecret, pinEnc, pinEncLen, pinEnc, &pinLenOut) !=
-        0) {
-        PRINTF("PIN decryption failed\n");
-        send_cbor_error(service, ERROR_PIN_POLICY_VIOLATION);
-        return;
+    // The token is genuine, now check what it was issued for
+    if ((authToken.permissions & permission) == 0) {
+        PRINTF("pinUvAuthToken lacks permission %d\n", permission);
+        return ERROR_PIN_AUTH_INVALID;
     }
-
-    if (pinLenOut != MAX_PIN_LENGTH) {
-        PRINTF("Invalid padded PIN length\n");
-        send_cbor_error(service, ERROR_INVALID_PAR);
-        return;
-    }
-
-    // Remove padding
-    for (int i = pinLenOut - 1; i != 0; i--) {
-        if (pinEnc[i] == 0) {
-            pinLenOut -= 1;
-        } else {
-            break;
+    if (authToken.hasRpId) {
+        if (memcmp(authToken.rpIdHash, rpIdHash, RP_ID_HASH_SIZE) != 0) {
+            PRINTF("pinUvAuthToken bound to another RP ID\n");
+            return ERROR_PIN_AUTH_INVALID;
         }
-    }
-    PRINTF("Decrypted PIN %.*H\n", pinLenOut, pinEnc);
-
-    if ((pinLenOut < MIN_PIN_LENGTH) || (pinLenOut >= MAX_PIN_LENGTH)) {
-        PRINTF("Invalid PIN length\n");
-        send_cbor_error(service, ERROR_PIN_POLICY_VIOLATION);
-        return;
+    } else {
+        // Associate the RP ID with the token on first use
+        memcpy(authToken.rpIdHash, rpIdHash, RP_ID_HASH_SIZE);
+        authToken.hasRpId = true;
     }
 
-    // Store LEFT(SHA-256(newPin), 16) as requested in
-    // https://fidoalliance.org/specs/fido2/fido-client-to-authenticator-protocol-v2.1-rd-20191217.html#settingNewPin
-    cx_hash_sha256(pinEnc, pinLenOut, pinEnc, CX_SHA256_SIZE);
-    PRINTF("PIN hash %.*H\n", PIN_HASH_SIZE, pinEnc);
-    config_set_ctap2_pin(pinEnc);
-
-    // Invalidate previous token and force the user to issue a GET_PIN_TOKEN command
-    authTokeninUse = false;
-
-    responseBuffer[0] = ERROR_NONE;
-    send_cbor_response(&G_io_u2f, 1, NULL);
-}
-
-static int check_pin_hash(int protocol,
-                          const uint8_t *sharedSecret,
-                          uint8_t *pinHashEnc,
-                          uint32_t pinHashEncLen) {
-    uint32_t pinHashLen;
-
-    config_decrease_ctap2_pin_retry_counter();
-
-    // Decrypt in place
-    if (ctap2_client_pin_decrypt(protocol,
-                                 sharedSecret,
-                                 pinHashEnc,
-                                 pinHashEncLen,
-                                 pinHashEnc,
-                                 &pinHashLen) != 0) {
-        PRINTF("PIN hash decryption failed\n");
-        ctap2TransientPinAuths++;
-        return ERROR_PIN_INVALID;
+    // mc is single use: the platform must request a new token (implying a new built-in UV) for
+    // each makeCredential.
+    // ga is not consumed here: platforms send several getAssertion requests with the same token
+    // (silent allowList probes with up=false, in batches, then the real request). It is spent by
+    // the request that asks for user presence, see ctap2_client_pin_clear_permission() called
+    // from getAssertion. The token also stays bound to its RP ID, is replaced by the next token
+    // and is cleared on reset / power cycle.
+    if (permission == PUAT_PERM_MC) {
+        authToken.permissions &= ~permission;
     }
-
-    if (!crypto_compare(pinHashEnc, (uint8_t *) N_u2f.pin, PIN_HASH_SIZE)) {
-        PRINTF("Computed PIN hash %.*H\n", PIN_HASH_SIZE, pinHashEnc);
-        PRINTF("Stored PIN hash %.*H\n", PIN_HASH_SIZE, N_u2f.pin);
-        if (ctap2_client_pin_regenerate() != 0) {
-            return ERROR_OTHER;
-        }
-        ctap2TransientPinAuths++;
-        if (N_u2f.pinRetries == 0) {
-            return ERROR_PIN_BLOCKED;
-        }
-        if (ctap2TransientPinAuths == MAX_TRANSIENT_PIN_AUTH_FAILURES) {
-            return ERROR_PIN_AUTH_BLOCKED;
-        }
-        return ERROR_PIN_INVALID;
-    }
-
-    config_reset_ctap2_pin_retry_counter();
-    ctap2TransientPinAuths = 0;
-
     return ERROR_NONE;
 }
 
 /******************************************/
 /*         Subcommands Handlers           */
 /******************************************/
-static void ctap2_handle_get_pin_retries(u2f_service_t *service,
-                                         cbipDecoder_t *decoder,
-                                         cbipItem_t *mapItem,
-                                         int protocol) {
-    UNUSED(decoder);
-    UNUSED(mapItem);
-    UNUSED(protocol);
-
-    cbipEncoder_t encoder;
-
-    PRINTF("ctap2_handle_get_pin_retries\n");
-    CHECK_PIN_SET();
-
-    cbip_encoder_init(&encoder, responseBuffer + 1, CUSTOM_IO_APDU_BUFFER_SIZE - 1);
-    cbip_add_map_header(&encoder, 1);
-    cbip_add_int(&encoder, TAG_RESP_RETRIES);
-    cbip_add_int(&encoder, N_u2f.pinRetries);
-
-    responseBuffer[0] = ERROR_NONE;
-    send_cbor_response(&G_io_u2f, 1 + encoder.offset, NULL);
-}
-
-static void ctap2_handle_get_key_agreement(u2f_service_t *service,
-                                           cbipDecoder_t *decoder,
-                                           cbipItem_t *mapItem,
-                                           int protocol) {
-    UNUSED(service);
-    UNUSED(decoder);
-    UNUSED(mapItem);
-    UNUSED(protocol);
-
+__attribute__((noinline)) static void ctap2_handle_get_key_agreement(u2f_service_t *service) {
     int status;
     cbipEncoder_t encoder;
     cx_ecfp_public_key_t publicKey;
@@ -489,185 +449,108 @@ static void ctap2_handle_get_key_agreement(u2f_service_t *service,
     send_cbor_response(&G_io_u2f, 1 + encoder.offset, NULL);
 }
 
-static void ctap2_handle_set_pin(u2f_service_t *service,
-                                 cbipDecoder_t *decoder,
-                                 cbipItem_t *mapItem,
-                                 int protocol) {
-    uint8_t *pinAuth;
-    uint32_t pinAuthLen;
-    uint8_t *newPinEnc;
-    uint32_t newPinEncLen;
-    uint8_t sharedSecret[SHARED_SECRET_MAX_SIZE];
-    int status;
-
-    PRINTF("client_pin_set_pin\n");
-    CHECK_PIN_NOT_SET();
-
-    status =
-        ctap2_client_pin_decapsulate(protocol, decoder, mapItem, TAG_KEY_AGREEMENT, sharedSecret);
-    if (status != ERROR_NONE) {
-        send_cbor_error(service, status);
-        return;
-    }
-
-    if (cbiph_get_map_key_bytes(decoder, mapItem, TAG_PIN_AUTH, &pinAuth, &pinAuthLen) !=
-        CBIPH_STATUS_FOUND) {
-        send_cbor_error(service, ERROR_MISSING_PARAMETER);
-        return;
-    }
-
-    if (cbiph_get_map_key_bytes(decoder, mapItem, TAG_NEW_PIN_ENC, &newPinEnc, &newPinEncLen) !=
-        CBIPH_STATUS_FOUND) {
-        send_cbor_error(service, ERROR_MISSING_PARAMETER);
-        return;
-    }
-
-    // Check pinAuth
-    if (!ctap2_client_pin_verify(protocol,
-                                 sharedSecret,
-                                 sizeof(sharedSecret),
-                                 newPinEnc,
-                                 newPinEncLen,
-                                 NULL,
-                                 0,
-                                 pinAuth,
-                                 pinAuthLen)) {
-        ctap2_client_pin_regenerate();
-        send_cbor_error(service, ERROR_PIN_AUTH_INVALID);
-        return;
-    }
-
-    handle_store_pin(service, protocol, sharedSecret, newPinEnc, newPinEncLen);
-}
-
-static void ctap2_handle_change_pin(u2f_service_t *service,
-                                    cbipDecoder_t *decoder,
-                                    cbipItem_t *mapItem,
-                                    int protocol) {
-    uint8_t *pinAuth;
-    uint32_t pinAuthLen;
-    uint8_t *pinHashEnc;
-    uint32_t pinHashEncLen;
-    uint8_t *newPinEnc;
-    uint32_t newPinEncLen;
-    uint8_t sharedSecret[SHARED_SECRET_MAX_SIZE];
-    int status;
-
-    PRINTF("client_pin_change_pin\n");
-    CHECK_PIN_SET();
-    CHECK_PIN_RETRIES();
-    CHECK_PIN_TRANSIENT_FAILURE();
-
-    status =
-        ctap2_client_pin_decapsulate(protocol, decoder, mapItem, TAG_KEY_AGREEMENT, sharedSecret);
-    if (status != ERROR_NONE) {
-        send_cbor_error(service, status);
-        return;
-    }
-
-    if (cbiph_get_map_key_bytes(decoder, mapItem, TAG_PIN_AUTH, &pinAuth, &pinAuthLen) !=
-        CBIPH_STATUS_FOUND) {
-        send_cbor_error(service, ERROR_MISSING_PARAMETER);
-        return;
-    }
-
-    if (cbiph_get_map_key_bytes(decoder, mapItem, TAG_PIN_HASH_ENC, &pinHashEnc, &pinHashEncLen) !=
-        CBIPH_STATUS_FOUND) {
-        send_cbor_error(service, ERROR_MISSING_PARAMETER);
-        return;
-    }
-
-    if (cbiph_get_map_key_bytes(decoder, mapItem, TAG_NEW_PIN_ENC, &newPinEnc, &newPinEncLen) !=
-        CBIPH_STATUS_FOUND) {
-        send_cbor_error(service, ERROR_MISSING_PARAMETER);
-        return;
-    }
-
-    // Check pinAuth
-    if (!ctap2_client_pin_verify(protocol,
-                                 sharedSecret,
-                                 sizeof(sharedSecret),
-                                 newPinEnc,
-                                 newPinEncLen,
-                                 pinHashEnc,
-                                 pinHashEncLen,
-                                 pinAuth,
-                                 pinAuthLen)) {
-        ctap2_client_pin_regenerate();
-        send_cbor_error(service, ERROR_PIN_AUTH_INVALID);
-        return;
-    }
-
-    // Check pinHashEnc
-    status = check_pin_hash(protocol, sharedSecret, pinHashEnc, pinHashEncLen);
-    if (status != ERROR_NONE) {
-        send_cbor_error(service, status);
-        return;
-    }
-
-    // Process new PIN
-    handle_store_pin(service, protocol, sharedSecret, newPinEnc, newPinEncLen);
-}
-
-static void ctap2_handle_get_pin_token(u2f_service_t *service,
-                                       cbipDecoder_t *decoder,
-                                       cbipItem_t *mapItem,
-                                       int protocol) {
-    int status;
-    uint8_t sharedSecret[SHARED_SECRET_MAX_SIZE];
-    uint8_t *pinHashEnc;
-    uint32_t pinHashEncLen;
+__attribute__((noinline)) static void ctap2_handle_get_uv_retries(u2f_service_t *service) {
     cbipEncoder_t encoder;
-    uint8_t tokenEnc[AUTH_TOKEN_MAX_ENC_SIZE];
-    uint32_t encryptedLength;
 
-    PRINTF("client_pin_get_pin_token\n");
+    PRINTF("client_pin_get_uv_retries\n");
 
-    CHECK_PIN_SET();
-    CHECK_PIN_RETRIES();
-    CHECK_PIN_TRANSIENT_FAILURE();
+    cbip_encoder_init(&encoder, responseBuffer + 1, CUSTOM_IO_APDU_BUFFER_SIZE - 1);
+    cbip_add_map_header(&encoder, 1);
+    cbip_add_int(&encoder, TAG_RESP_UV_RETRIES);
+    cbip_add_int(&encoder, UV_RETRIES_NOMINAL);
 
+    responseBuffer[0] = ERROR_NONE;
+    send_cbor_response(service, 1 + encoder.offset, NULL);
+}
+
+__attribute__((noinline)) static void ctap2_handle_get_uv_token(u2f_service_t *service,
+                                      cbipDecoder_t *decoder,
+                                      cbipItem_t *mapItem,
+                                      int protocol) {
+    int status;
+    int permissions;
+    char *rpId = NULL;
+    uint32_t rpIdLen = 0;
+    uint8_t *sharedSecret = uvSharedSecret;
+    uint8_t *tokenEnc = uvTokenEnc;
+    uint32_t tokenEncLen;
+    cbipEncoder_t encoder;
+
+    PRINTF("client_pin_get_uv_token\n");
+
+    memset(uvSharedSecret, 0, sizeof(uvSharedSecret));
     status =
         ctap2_client_pin_decapsulate(protocol, decoder, mapItem, TAG_KEY_AGREEMENT, sharedSecret);
     if (status != ERROR_NONE) {
         send_cbor_error(service, status);
-        return;
+        goto end;
     }
 
-    // Check pinHashEnc
-    if (cbiph_get_map_key_bytes(decoder, mapItem, TAG_PIN_HASH_ENC, &pinHashEnc, &pinHashEncLen) !=
-        CBIPH_STATUS_FOUND) {
+    // permissions
+    status = cbiph_get_map_key_int(decoder, mapItem, TAG_PERMISSIONS, &permissions);
+    if (status != CBIPH_STATUS_FOUND) {
         send_cbor_error(service, ERROR_MISSING_PARAMETER);
-        return;
+        goto end;
+    }
+    if (permissions <= 0) {
+        send_cbor_error(service, ERROR_INVALID_PAR);
+        goto end;
+    }
+    if ((permissions & ~PUAT_PERM_SUPPORTED) != 0) {
+        PRINTF("Unsupported permissions 0x%x\n", permissions);
+        send_cbor_error(service, ERROR_UNAUTHORIZED_PERMISSION);
+        goto end;
     }
 
-    status = check_pin_hash(protocol, sharedSecret, pinHashEnc, pinHashEncLen);
-    if (status != ERROR_NONE) {
-        send_cbor_error(service, status);
-        return;
+    // rpId, mandatory for mc / ga
+    status = cbiph_get_map_key_text(decoder, mapItem, TAG_RP_ID, &rpId, &rpIdLen);
+    if (status == CBIPH_STATUS_NOT_FOUND) {
+        send_cbor_error(service, ERROR_MISSING_PARAMETER);
+        goto end;
+    }
+    if (status != CBIPH_STATUS_FOUND) {
+        send_cbor_error(service, cbiph_map_cbor_error(status));
+        goto end;
     }
 
-    // Prepare token
-    authTokenProtocol = protocol;
-    cx_rng_no_throw(authToken, AUTH_TOKEN_SIZE);
-    authTokeninUse = true;
-    PRINTF("Generated pin token %.*H\n", AUTH_TOKEN_SIZE, authToken);
+    // A new token replaces the previous one
+    invalidate_token();
 
-    ctap2_client_pin_encrypt(protocol,
-                             sharedSecret,
-                             authToken,
-                             AUTH_TOKEN_SIZE,
-                             tokenEnc,
-                             &encryptedLength);
+    // The user is verified by the unlocked device itself, no further action is needed here. User
+    // presence is still collected on the device when the token is used.
+    performBuiltInUv();
 
-    // Generate the response
+    authToken.protocol = protocol;
+    authToken.length =
+        (protocol == PIN_PROTOCOL_VERSION_V1) ? AUTH_TOKEN_V1_SIZE : AUTH_TOKEN_V2_SIZE;
+    cx_rng_no_throw(authToken.value, authToken.length);
+    authToken.permissions = (uint8_t) permissions;
+    cx_hash_sha256((const uint8_t *) rpId, rpIdLen, authToken.rpIdHash, RP_ID_HASH_SIZE);
+    authToken.hasRpId = true;
+    authToken.inUse = true;
+
+    if (ctap2_client_pin_encrypt(protocol,
+                                 sharedSecret,
+                                 authToken.value,
+                                 authToken.length,
+                                 tokenEnc,
+                                 &tokenEncLen) != 0) {
+        invalidate_token();
+        send_cbor_error(service, ERROR_OTHER);
+        goto end;
+    }
+
     cbip_encoder_init(&encoder, responseBuffer + 1, CUSTOM_IO_APDU_BUFFER_SIZE - 1);
     cbip_add_map_header(&encoder, 1);
     cbip_add_int(&encoder, TAG_RESP_PIN_TOKEN);
-    cbip_add_byte_string(&encoder, tokenEnc, encryptedLength);
+    cbip_add_byte_string(&encoder, tokenEnc, tokenEncLen);
 
     responseBuffer[0] = ERROR_NONE;
     send_cbor_response(&G_io_u2f, 1 + encoder.offset, NULL);
+
+end:
+    explicit_bzero(uvSharedSecret, sizeof(uvSharedSecret));
+    explicit_bzero(uvTokenEnc, sizeof(uvTokenEnc));
 }
 
 /******************************************/
@@ -677,8 +560,8 @@ void ctap2_client_pin_handle(u2f_service_t *service, uint8_t *buffer, uint16_t l
     cbipDecoder_t decoder;
     cbipItem_t mapItem;
     int status;
-    int protocol;
-    int tmp;
+    int protocol = 0;
+    int subcommand;
 
     PRINTF("ctap2_client_pin_handle\n");
 
@@ -690,52 +573,51 @@ void ctap2_client_pin_handle(u2f_service_t *service, uint8_t *buffer, uint16_t l
         return;
     }
 
-    // Check PIN protocol version
+    // Check subcommand
+    status = cbiph_get_map_key_int(&decoder, &mapItem, TAG_SUBCOMMAND, &subcommand);
+    if (status != CBIPH_STATUS_FOUND) {
+        PRINTF("Error fetching subcommand\n");
+        send_cbor_error(service, cbiph_map_cbor_error(status));
+        return;
+    }
+
+    // getUVRetries needs no PIN/UV auth protocol, the other ones do
+    if (subcommand == SUBCOMMAND_GET_UV_RETRIES) {
+        ctap2_handle_get_uv_retries(service);
+        return;
+    }
+
+    switch (subcommand) {
+        case SUBCOMMAND_GET_KEY_AGREEMENT:
+        case SUBCOMMAND_GET_UV_TOKEN:
+            break;
+        default:
+            // Includes all the PIN related subcommands: there is no client PIN.
+            PRINTF("Unsupported subcommand %d\n", subcommand);
+            send_cbor_error(service, ERROR_UNSUPPORTED_OPTION);
+            return;
+    }
+
     status = cbiph_get_map_key_int(&decoder, &mapItem, TAG_PIN_PROTOCOL, &protocol);
     if (status != CBIPH_STATUS_FOUND) {
         PRINTF("Error fetching pin protocol\n");
         send_cbor_error(service, cbiph_map_cbor_error(status));
         return;
     }
-    if (protocol != PIN_PROTOCOL_VERSION_V1) {
+    if (!ctap2_client_pin_protocol_supported(protocol)) {
         PRINTF("Unsupported pin protocol version\n");
         send_cbor_error(service, ERROR_INVALID_PAR);
         return;
     }
 
-    // Check subcommand
-    status = cbiph_get_map_key_int(&decoder, &mapItem, TAG_SUBCOMMAND, &tmp);
-    if (status != CBIPH_STATUS_FOUND) {
-        PRINTF("Error fetching subcommand\n");
-        send_cbor_error(service, cbiph_map_cbor_error(status));
-        return;
-    }
-    switch (tmp) {
-        case SUBCOMMAND_GET_PIN_RETRIES:
-            ctap2_handle_get_pin_retries(service, &decoder, &mapItem, protocol);
-            break;
-        case SUBCOMMAND_GET_KEY_AGREEMENT:
-            ctap2_handle_get_key_agreement(service, &decoder, &mapItem, protocol);
-            break;
-        case SUBCOMMAND_SET_PIN:
-            ctap2_handle_set_pin(service, &decoder, &mapItem, protocol);
-            break;
-        case SUBCOMMAND_CHANGE_PIN:
-            ctap2_handle_change_pin(service, &decoder, &mapItem, protocol);
-            break;
-        case SUBCOMMAND_GET_PIN_TOKEN:
-            ctap2_handle_get_pin_token(service, &decoder, &mapItem, protocol);
-            break;
-        default:
-            PRINTF("Unsupported subcommand %d\n", tmp);
-            send_cbor_error(service, ERROR_UNSUPPORTED_OPTION);
-            break;
+    if (subcommand == SUBCOMMAND_GET_KEY_AGREEMENT) {
+        ctap2_handle_get_key_agreement(service);
+    } else {
+        ctap2_handle_get_uv_token(service, &decoder, &mapItem, protocol);
     }
 }
 
 void ctap2_client_pin_reset_ctx(void) {
     ctap2_client_pin_regenerate();
-    authTokeninUse = false;
-
-    ctap2TransientPinAuths = 0;
+    invalidate_token();
 }

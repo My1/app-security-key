@@ -57,6 +57,9 @@
 #define TRANSPORT_USB "usb"
 #define TRANSPORT_NFC "nfc"
 
+#define PUAT_ADVERTISE_CLIENT_PIN 1
+
+
 static void cbip_add_option(cbipEncoder_t *encoder,
                             const char *option_desc,
                             size_t option_desc_size,
@@ -88,14 +91,25 @@ void ctap2_get_info_handle(u2f_service_t *service, uint8_t *buffer, uint16_t len
 
     cbip_encoder_init(&encoder, responseBuffer + 1, CUSTOM_IO_APDU_BUFFER_SIZE - 1);
 
+#ifdef PUAT_GETINFO_TRANSPORTS
+    cbip_add_map_header(&encoder, 7);
+#else
     cbip_add_map_header(&encoder, 6);
+#endif
 
     // versions (0x01)
 
     cbip_add_int(&encoder, TAG_VERSIONS);
+#ifdef PUAT_ADVERTISE_FIDO_2_1
+    cbip_add_array_header(&encoder, 3);
+#else
     cbip_add_array_header(&encoder, 2);
+#endif
     cbip_add_string(&encoder, VERSION_U2F, sizeof(VERSION_U2F) - 1);
     cbip_add_string(&encoder, VERSION_FIDO2, sizeof(VERSION_FIDO2) - 1);
+#ifdef PUAT_ADVERTISE_FIDO_2_1
+    cbip_add_string(&encoder, VERSION_FIDO21, sizeof(VERSION_FIDO21) - 1);
+#endif
     /* cbip_add_string(&encoder, VERSION_FIDO21_PRE, sizeof(VERSION_FIDO21_PRE) - 1); */
     /* cbip_add_string(&encoder, VERSION_FIDO21, sizeof(VERSION_FIDO21) - 1); */
 
@@ -114,7 +128,11 @@ void ctap2_get_info_handle(u2f_service_t *service, uint8_t *buffer, uint16_t len
     // Ordered correctly - see here:
     // https://fidoalliance.org/specs/fido-v2.2-rd-20241003/fido-client-to-authenticator-protocol-v2.2-rd-20241003.html#message-encoding
     cbip_add_int(&encoder, TAG_OPTIONS);
+#ifdef PUAT_ADVERTISE_CLIENT_PIN
+    cbip_add_map_header(&encoder, 6);
+#else
     cbip_add_map_header(&encoder, 5);
+#endif
 #ifdef ENABLE_RK_CONFIG
     cbip_add_option(&encoder,
                     OPTION_RESIDENT_KEY,
@@ -124,26 +142,32 @@ void ctap2_get_info_handle(u2f_service_t *service, uint8_t *buffer, uint16_t len
     cbip_add_option(&encoder, OPTION_RESIDENT_KEY, sizeof(OPTION_RESIDENT_KEY) - 1, true);
 #endif
     cbip_add_option(&encoder, OPTION_USER_PRESENCE, sizeof(OPTION_USER_PRESENCE) - 1, true);
-    // The device unlock PIN is our built-in UV, but it can only be advertised while
-    // no client PIN is set: once one is, CTAP2.0 requires pinAuth on every request.
+    // The device unlock PIN is our built-in UV: it is always available and there is no separate
+    // FIDO client PIN, hence no "clientPin" option (absent means "not supported").
     cbip_add_option(&encoder,
                     OPTION_USER_VERIFICATION,
                     sizeof(OPTION_USER_VERIFICATION) - 1,
-                    !N_u2f.pinSet);
+                    true);
     cbip_add_option(&encoder, OPTION_PLAT, sizeof(OPTION_PLAT) - 1, false);
-    /*
-    cbip_add_option(&encoder, OPTION_ALWAYS_UV, sizeof(OPTION_ALWAYS_UV) - 1, false);
-    cbip_add_option(&encoder, OPTION_CRED_MGMT, sizeof(OPTION_CRED_MGMT) - 1, true);
-    cbip_add_option(&encoder, OPTION_AUTHN_CFG, sizeof(OPTION_AUTHN_CFG) - 1, true);
-    */
-    cbip_add_option(&encoder, OPTION_CLIENT_PIN, sizeof(OPTION_CLIENT_PIN) - 1, N_u2f.pinSet);
-    /*
-    cbip_add_option(&encoder,
-                    OPTION_LARGE_BLOBS, sizeof(OPTION_LARGE_BLOBS) - 1, true);
+#ifdef PUAT_ADVERTISE_CLIENT_PIN
+    // Play Services (Android) only takes its pinUvAuthToken / built-in UV path when "clientPin" is
+    // advertised as true. There is no FIDO PIN on this authenticator: the PIN subcommands answer
+    // UNSUPPORTED_OPTION, and since "uv" is true platforms use built-in UV instead of asking for
+    // a PIN. Side effects to watch for: platforms that insist on PIN UV, and tools that query
+    // the PIN retries (fido2-token -I).
+    cbip_add_option(&encoder, OPTION_CLIENT_PIN, sizeof(OPTION_CLIENT_PIN) - 1, true);
+#endif
+    // pinUvAuthToken: getPinUvAuthTokenUsingUvWithPermissions is supported (mc and ga permissions)
     cbip_add_option(&encoder,
                     OPTION_PIN_UV_AUTH_TOKEN,
                     sizeof(OPTION_PIN_UV_AUTH_TOKEN) - 1,
                     true);
+    /*
+    cbip_add_option(&encoder, OPTION_ALWAYS_UV, sizeof(OPTION_ALWAYS_UV) - 1, false);
+    cbip_add_option(&encoder, OPTION_CRED_MGMT, sizeof(OPTION_CRED_MGMT) - 1, true);
+    cbip_add_option(&encoder, OPTION_AUTHN_CFG, sizeof(OPTION_AUTHN_CFG) - 1, true);
+    cbip_add_option(&encoder,
+                    OPTION_LARGE_BLOBS, sizeof(OPTION_LARGE_BLOBS) - 1, true);
     cbip_add_option(&encoder,
                     OPTION_SET_MIN_PIN_LENGTH,
                     sizeof(OPTION_SET_MIN_PIN_LENGTH) - 1, true);
@@ -164,9 +188,26 @@ void ctap2_get_info_handle(u2f_service_t *service, uint8_t *buffer, uint16_t len
 
     // pinProtocols (0x06)
 
+    // In order of preference
     cbip_add_int(&encoder, TAG_PIN_PROTOCOLS);
-    cbip_add_array_header(&encoder, 1);
+    cbip_add_array_header(&encoder, 2);
+    cbip_add_int(&encoder, PIN_PROTOCOL_VERSION_V2);
     cbip_add_int(&encoder, PIN_PROTOCOL_VERSION_V1);
+
+#ifdef PUAT_GETINFO_TRANSPORTS
+    // transports (0x09)
+
+    cbip_add_int(&encoder, TAG_TRANSPORTS);
+#ifdef HAVE_NFC
+    cbip_add_array_header(&encoder, 2);
+#else
+    cbip_add_array_header(&encoder, 1);
+#endif  // HAVE_NFC
+    cbip_add_string(&encoder, TRANSPORT_USB, sizeof(TRANSPORT_USB) - 1);
+#ifdef HAVE_NFC
+    cbip_add_string(&encoder, TRANSPORT_NFC, sizeof(TRANSPORT_NFC) - 1);
+#endif  // HAVE_NFC
+#endif  // PUAT_GETINFO_TRANSPORTS
 
     /*
     // transports (0x09)

@@ -205,47 +205,62 @@ static int decode_options(cbipDecoder_t *decoder, cbipItem_t *mapItem) {
 static int decode_pin(cbipDecoder_t *decoder, cbipItem_t *mapItem) {
     ctap2_assert_data_t *ctap2AssertData = globals_get_ctap2_assert_data();
     int status;
-    int pinProtocolVersion = 0;
-    uint8_t *pinAuth;
-    uint32_t pinAuthLen;
+    int pinUvProtocol = 0;
+    uint8_t *pinUvAuthParam;
+    uint32_t pinUvAuthParamLen;
 
-    status = cbiph_get_map_key_int(decoder, mapItem, TAG_PIN_PROTOCOL, &pinProtocolVersion);
+    status = cbiph_get_map_key_int(decoder, mapItem, TAG_PIN_PROTOCOL, &pinUvProtocol);
     if (status == CBIPH_STATUS_FOUND) {
-        if (pinProtocolVersion != PIN_PROTOCOL_VERSION_V1) {
-            PRINTF("Unsupported PIN protocol version\n");
+        if (!ctap2_client_pin_protocol_supported(pinUvProtocol)) {
+            PRINTF("Unsupported PIN/UV protocol version\n");
             return ERROR_PIN_AUTH_INVALID;
         }
     }
 
-    status = cbiph_get_map_key_bytes(decoder, mapItem, TAG_PIN_AUTH, &pinAuth, &pinAuthLen);
-    if (status > 0) {
-        if (!N_u2f.pinSet) {
-            PRINTF("PIN not set\n");
-            return ERROR_PIN_NOT_SET;
-        }
-
-        if (pinAuthLen == 0) {
-            // DEVIATION from FIDO2.0 spec: "If platform sends zero length pinAuth,
-            // authenticator needs to wait for user touch and then returns [...]"
-            // Impact is minor because user as still manually unlocked it's device.
-            // therefore user presence is somehow guarantee.
-            return ERROR_PIN_INVALID;
-        }
-
-        status = ctap2_client_pin_verify_auth_token(pinProtocolVersion,
-                                                    ctap2AssertData->clientDataHash,
-                                                    CX_SHA256_SIZE,
-                                                    pinAuth,
-                                                    pinAuthLen);
-        if (status != ERROR_NONE) {
-            return ERROR_PIN_AUTH_INVALID;
-        }
-        // from spec: """pinUvAuthParam and the "uv" option are processed as mutually exclusive
-        //               with pinUvAuthParam taking precedence."""
-        ctap2AssertData->pinRequired = false;
-        ctap2AssertData->clientPinAuthenticated = 1;
-        PRINTF("Client PIN authenticated\n");
+    status = cbiph_get_map_key_bytes(decoder,
+                                     mapItem,
+                                     TAG_PIN_AUTH,
+                                     &pinUvAuthParam,
+                                     &pinUvAuthParamLen);
+    if (status != CBIPH_STATUS_FOUND) {
+        // No pinUvAuthParam: user verification is only performed if the "uv" option is set
+        return 0;
     }
+
+    if (pinUvProtocol == 0) {
+        return ERROR_MISSING_PARAMETER;
+    }
+
+    if (pinUvAuthParamLen == 0) {
+        // DEVIATION from FIDO2.1 spec: "If platform sends zero length pinUvAuthParam,
+        // authenticator needs to wait for user touch and then returns [...]"
+        // Impact is minor because the user has still manually unlocked its device.
+        // Built-in UV is available, so the spec'd answer is PIN_INVALID.
+        return ERROR_PIN_INVALID;
+    }
+
+    status = ctap2_client_pin_verify_auth_token(pinUvProtocol,
+                                                PUAT_PERM_GA,
+                                                ctap2AssertData->rpIdHash,
+                                                ctap2AssertData->clientDataHash,
+                                                CX_SHA256_SIZE,
+                                                pinUvAuthParam,
+                                                pinUvAuthParamLen);
+    if (status != ERROR_NONE) {
+        return ERROR_PIN_AUTH_INVALID;
+    }
+
+    // The request that asks for user presence spends the token. Silent requests (up=false, used
+    // by platforms to probe the allowList) leave it usable for the real one.
+    if (ctap2AssertData->userPresenceRequired) {
+        ctap2_client_pin_clear_permission(PUAT_PERM_GA);
+    }
+
+    // from spec: "pinUvAuthParam and the "uv" option are processed as mutually exclusive
+    //             with pinUvAuthParam taking precedence."
+    ctap2AssertData->pinRequired = false;
+    ctap2AssertData->pinUvAuthenticated = 1;
+    PRINTF("pinUvAuthParam verified\n");
 
     return 0;
 }
@@ -359,8 +374,11 @@ void ctap2_get_assertion_handle(u2f_service_t *service, uint8_t *buffer, uint16_
     if (CMD_IS_OVER_U2F_NFC) {
         // No up nor uv requested, skip UX and reply immediately
         nfc_handle_get_assertion();
-    } else if (!ctap2AssertData->userPresenceRequired && !ctap2AssertData->pinRequired) {
-        // No up nor uv required, skip UX and reply immediately
+    } else if (!ctap2AssertData->userPresenceRequired && !ctap2AssertData->pinRequired &&
+               !ctap2AssertData->pinUvAuthenticated) {
+        // No up nor uv required, skip UX and reply immediately.
+        // A request authenticated with a pinUvAuthToken always goes through the UX: never
+        // report a verified user to the RP without the user being in front of the device.
         get_assertion_confirm(1);
     } else {
         // Look for a potential rk entry if no allow list was provided

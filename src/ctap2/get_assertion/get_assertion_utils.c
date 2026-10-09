@@ -86,8 +86,9 @@ static int compute_hmacSecret_output(uint8_t **output, uint32_t *outputLen, uint
     uint8_t *saltEnc;
     uint32_t saltEncLength;
     int status;
-    uint8_t sharedSecret[SHARED_SECRET_MAX_SIZE];
+    uint8_t sharedSecret[SHARED_SECRET_MAX_SIZE] = {0};
     uint8_t *salt;
+    int protocol = PIN_PROTOCOL_VERSION_V1;
 
     // Attempt to process hmac-secret extension if flagged for processing
     cbip_decoder_init(&decoder, ctap2AssertData->buffer, CUSTOM_IO_APDU_BUFFER_SIZE);
@@ -96,8 +97,20 @@ static int compute_hmacSecret_output(uint8_t **output, uint32_t *outputLen, uint
     GET_MAP_KEY_ITEM(&decoder, &mapItem, TAG_EXTENSIONS, tmpItem, cbipMap);
     GET_MAP_STR_KEY_ITEM(&decoder, &tmpItem, EXTENSION_HMAC_SECRET, mapItem, cbipMap);
 
+    // Check optional PIN/UV auth protocol, protocol 1 if absent
+    status = cbiph_get_map_key_int(&decoder, &mapItem, TAG_HMAC_SECRET_PIN_UV_PROTOCOL, &protocol);
+    if (status == CBIPH_STATUS_NOT_FOUND) {
+        protocol = PIN_PROTOCOL_VERSION_V1;
+    } else if (status != CBIPH_STATUS_FOUND) {
+        return cbiph_map_cbor_error(status);
+    }
+    if (!ctap2_client_pin_protocol_supported(protocol)) {
+        PRINTF("Unsupported hmac-secret PIN/UV protocol %d\n", protocol);
+        return ERROR_INVALID_PAR;
+    }
+
     // Check KEY_AGREEMENT
-    status = ctap2_client_pin_decapsulate(PIN_PROTOCOL_VERSION_V1,
+    status = ctap2_client_pin_decapsulate(protocol,
                                           &decoder,
                                           &mapItem,
                                           TAG_HMAC_SECRET_KEY_AGREEMENT,
@@ -128,7 +141,7 @@ static int compute_hmacSecret_output(uint8_t **output, uint32_t *outputLen, uint
     }
 
     // Verify saltAuth
-    if (!ctap2_client_pin_verify(PIN_PROTOCOL_VERSION_V1,
+    if (!ctap2_client_pin_verify(protocol,
                                  sharedSecret,
                                  sizeof(sharedSecret),
                                  saltEnc,
@@ -141,7 +154,7 @@ static int compute_hmacSecret_output(uint8_t **output, uint32_t *outputLen, uint
     }
 
     // Decrypt salt in place
-    status = ctap2_client_pin_decrypt(PIN_PROTOCOL_VERSION_V1,
+    status = ctap2_client_pin_decrypt(protocol,
                                       sharedSecret,
                                       saltEnc,
                                       saltEncLength,
@@ -175,7 +188,7 @@ static int compute_hmacSecret_output(uint8_t **output, uint32_t *outputLen, uint
     }
 
     // Encrypt salt into saltEnc
-    status = ctap2_client_pin_encrypt(PIN_PROTOCOL_VERSION_V1,
+    status = ctap2_client_pin_encrypt(protocol,
                                       sharedSecret,
                                       salt,
                                       saltLength,
@@ -205,7 +218,7 @@ static int build_authData(uint8_t *buffer, uint32_t bufferLength, uint32_t *auth
 
     // flags
     buffer[offset] = 0;
-    if (ctap2AssertData->pinRequired || ctap2AssertData->clientPinAuthenticated) {
+    if (ctap2AssertData->pinRequired || ctap2AssertData->pinUvAuthenticated) {
         buffer[offset] |= AUTHDATA_FLAG_USER_VERIFIED;
     }
     if (ctap2AssertData->userPresenceRequired) {
@@ -236,9 +249,13 @@ static int build_authData(uint8_t *buffer, uint32_t bufferLength, uint32_t *auth
             uint8_t *salt = NULL;
             uint32_t saltLength = 0;
 
-            crypto_generate_credRandom_key(ctap2AssertData->nonce,
-                                           credRandom,
-                                           ctap2AssertData->pinRequired);
+            // CredRandomWithUV is used whenever the user was verified, whether the platform asked
+            // for it with the "uv" option or with a pinUvAuthParam: the hmac-secret output of a
+            // credential must not depend on which of the two was used.
+            crypto_generate_credRandom_key(
+                ctap2AssertData->nonce,
+                credRandom,
+                ctap2AssertData->pinRequired || ctap2AssertData->pinUvAuthenticated);
 
             status = compute_hmacSecret_output(&salt, &saltLength, credRandom);
             if (status != ERROR_NONE) {

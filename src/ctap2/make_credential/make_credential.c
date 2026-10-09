@@ -365,50 +365,56 @@ static int process_makeCred_authnr_options(cbipDecoder_t *decoder, cbipItem_t *m
 static int process_makeCred_authnr_pin(cbipDecoder_t *decoder, cbipItem_t *mapItem) {
     ctap2_register_data_t *ctap2RegisterData = globals_get_ctap2_register_data();
     int status;
-    int pinProtocolVersion = 0;
-    uint8_t *pinAuth;
-    uint32_t pinAuthLen;
+    int pinUvProtocol = 0;
+    uint8_t *pinUvAuthParam;
+    uint32_t pinUvAuthParamLen;
 
-    status = cbiph_get_map_key_int(decoder, mapItem, TAG_PIN_PROTOCOL, &pinProtocolVersion);
+    status = cbiph_get_map_key_int(decoder, mapItem, TAG_PIN_PROTOCOL, &pinUvProtocol);
     if (status == CBIPH_STATUS_FOUND) {
-        if (pinProtocolVersion != PIN_PROTOCOL_VERSION_V1) {
-            PRINTF("Unsupported PIN protocol version\n");
+        if (!ctap2_client_pin_protocol_supported(pinUvProtocol)) {
+            PRINTF("Unsupported PIN/UV protocol version\n");
             return ERROR_PIN_AUTH_INVALID;
         }
     }
 
-    status = cbiph_get_map_key_bytes(decoder, mapItem, TAG_PIN_AUTH, &pinAuth, &pinAuthLen);
-    if (status == CBIPH_STATUS_FOUND) {
-        if (!N_u2f.pinSet) {
-            PRINTF("PIN not set\n");
-            return ERROR_PIN_NOT_SET;
-        }
-
-        if (pinAuthLen == 0) {
-            // DEVIATION from FIDO2.0 spec: "If platform sends zero length pinAuth,
-            // authenticator needs to wait for user touch and then returns [...]"
-            // Impact is minor because user as still manually unlocked it's device.
-            // therefore user presence is somehow guarantee.
-            return ERROR_PIN_INVALID;
-        }
-
-        status = ctap2_client_pin_verify_auth_token(pinProtocolVersion,
-                                                    ctap2RegisterData->clientDataHash,
-                                                    CX_SHA256_SIZE,
-                                                    pinAuth,
-                                                    pinAuthLen);
-        if (status != ERROR_NONE) {
-            return ERROR_PIN_AUTH_INVALID;
-        }
-
-        ctap2RegisterData->clientPinAuthenticated = 1;
-        PRINTF("Client PIN authenticated\n");
-    } else {
-        if (N_u2f.pinSet) {
-            PRINTF("PIN set and no PIN authentication provided\n");
-            return ERROR_PIN_REQUIRED;
-        }
+    status = cbiph_get_map_key_bytes(decoder,
+                                     mapItem,
+                                     TAG_PIN_AUTH,
+                                     &pinUvAuthParam,
+                                     &pinUvAuthParamLen);
+    if (status != CBIPH_STATUS_FOUND) {
+        // No pinUvAuthParam: user verification is only performed if the "uv" option is set
+        return 0;
     }
+
+    if (pinUvProtocol == 0) {
+        return ERROR_MISSING_PARAMETER;
+    }
+
+    if (pinUvAuthParamLen == 0) {
+        // DEVIATION from FIDO2.1 spec: "If platform sends zero length pinUvAuthParam,
+        // authenticator needs to wait for user touch and then returns [...]"
+        // Impact is minor because the user has still manually unlocked its device.
+        // Built-in UV is available, so the spec'd answer is PIN_INVALID.
+        return ERROR_PIN_INVALID;
+    }
+
+    status = ctap2_client_pin_verify_auth_token(pinUvProtocol,
+                                                PUAT_PERM_MC,
+                                                ctap2RegisterData->rpIdHash,
+                                                ctap2RegisterData->clientDataHash,
+                                                CX_SHA256_SIZE,
+                                                pinUvAuthParam,
+                                                pinUvAuthParamLen);
+    if (status != ERROR_NONE) {
+        return ERROR_PIN_AUTH_INVALID;
+    }
+
+    // from spec: "pinUvAuthParam and the "uv" option are processed as mutually exclusive
+    //             with pinUvAuthParam taking precedence."
+    ctap2RegisterData->pinRequired = 0;
+    ctap2RegisterData->pinUvAuthenticated = 1;
+    PRINTF("pinUvAuthParam verified\n");
 
     return 0;
 }
