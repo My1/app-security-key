@@ -1,6 +1,7 @@
 import pytest
 import sys
 from fido2.webauthn import AttestedCredentialData
+from ledgered.devices import DeviceType
 
 from ragger.navigator import NavInsID, NavIns
 
@@ -24,9 +25,12 @@ def test_fido_screens_settings(client, test_name):
 
         # Enable and check "Enabling" warning message
         instructions.append(NavInsID.BOTH_CLICK)
-
-        # Screen 0 -> 5
-        instructions += [NavInsID.RIGHT_CLICK] * 5
+        if client.ledger_device.type != DeviceType.NANOS:
+            # Screen 0 -> 5
+            instructions += [NavInsID.RIGHT_CLICK] * 5
+        else:
+            # Screen 0 -> 13
+            instructions += [NavInsID.RIGHT_CLICK] * 13
 
         # Confirm
         instructions.append(NavInsID.BOTH_CLICK)

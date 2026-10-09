@@ -21,7 +21,7 @@ endif
 include $(BOLOS_SDK)/Makefile.defines
 
 $(info TARGET_NAME=$(TARGET_NAME))
-ifneq ($(TARGET_NAME),$(filter $(TARGET_NAME),TARGET_NANOX TARGET_NANOS2 TARGET_STAX TARGET_FLEX TARGET_APEX_P))
+ifneq ($(TARGET_NAME),$(filter $(TARGET_NAME),TARGET_NANOS TARGET_NANOX TARGET_NANOS2 TARGET_STAX TARGET_FLEX TARGET_APEX_P))
 $(error Environment variable TARGET_NAME is not valid or not supported)
 endif
 
@@ -36,6 +36,7 @@ APPVERSION_N=7
 APPVERSION_P=7
 APPVERSION=$(APPVERSION_M).$(APPVERSION_N).$(APPVERSION_P)
 
+ICON_NANOS=icons/icon_security_key_nanos.gif
 ICON_NANOX=icons/icon_security_key.gif
 ICON_NANOSP=icons/icon_security_key.gif
 ICON_STAX=icons/icon_security_key_stax.gif
@@ -45,6 +46,16 @@ ICON_APEX_P=icons/icon_security_key_apex_p.png
 ################
 # Attestations #
 ################
+PROD_U2F_NANOS_PRIVATE_KEY?=0
+ifneq ($(PROD_U2F_NANOS_PRIVATE_KEY),0)
+    DEFINES += PROD_U2F_NANOS_PRIVATE_KEY=${PROD_U2F_NANOS_PRIVATE_KEY}
+endif
+
+PROD_FIDO2_NANOS_PRIVATE_KEY?=0
+ifneq ($(PROD_FIDO2_NANOS_PRIVATE_KEY),0)
+    DEFINES += PROD_FIDO2_NANOS_PRIVATE_KEY=${PROD_FIDO2_NANOS_PRIVATE_KEY}
+endif
+
 PROD_U2F_NANOX_PRIVATE_KEY?=0
 ifneq ($(PROD_U2F_NANOX_PRIVATE_KEY),0)
     DEFINES += PROD_U2F_NANOX_PRIVATE_KEY=${PROD_U2F_NANOX_PRIVATE_KEY}
@@ -158,7 +169,11 @@ endif
 
 DEFINES += HAVE_FIDO2_RPID_FILTER
 
+ifeq ($(TARGET_NAME),TARGET_NANOS)
+DEFINES += RK_SIZE=2048
+else
 DEFINES += RK_SIZE=6144
+endif
 
 DISABLE_OS_IO_STACK_USE = 1
 
@@ -181,6 +196,16 @@ ENABLE_NFC = 1
 # Application source files
 APP_SOURCE_PATH  += src cbor-src
 SDK_SOURCE_PATH  += lib_u2f
+
+ifeq ($(API_LEVEL),)
+# Specific files for Nanos device which OS CX lib doesn't provide the needed
+# AES_SIV functions.
+# Check on API_LEVEL rather than TARGET_NAME to allow compilation on unified SDK.
+DEFINES += HAVE_AES_SIV HAVE_AES HAVE_CMAC
+INCLUDES_PATH += $(BOLOS_SDK)/lib_cxng/src
+APP_SOURCE_FILES += $(BOLOS_SDK)/lib_cxng/src/cx_ram.c
+APP_SOURCE_PATH  += sdk-lib-cxng-copy
+endif
 
 VARIANT_PARAM = APP
 VARIANT_VALUES = SecurityKey
