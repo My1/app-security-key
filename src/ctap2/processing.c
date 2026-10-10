@@ -62,14 +62,16 @@ void ctap2_handle_cmd_cbor(u2f_service_t *service, uint8_t *buffer, uint16_t len
                 send_cbor_error(service, ERROR_OPERATION_PENDING);
                 return;
             }
-            if (length > sizeof(ctap2RequestBuffer)) {
+            if (length > IO_APDU_BUFFER_SIZE) {
                 PRINTF("CBOR command too long\n");
                 send_cbor_error(service, ERROR_REQUEST_TOO_LARGE);
                 return;
             }
+#ifndef TARGET_NANOS
             // G_io_apdu_buffer does not survive the user review.
             memcpy(ctap2RequestBuffer, buffer, length);
             buffer = ctap2RequestBuffer;
+#endif
             break;
         default:
             break;

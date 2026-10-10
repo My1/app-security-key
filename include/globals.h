@@ -132,7 +132,11 @@ extern uint8_t responseBuffer[IO_APDU_BUFFER_SIZE];
 // App-owned copy of the CBOR request. G_io_apdu_buffer aliases G_io_tx_buffer and
 // is overwritten by the next command without the app being called, while handlers
 // keep pointers into their request across the user review.
+#ifndef TARGET_NANOS
 extern uint8_t ctap2RequestBuffer[IO_APDU_BUFFER_SIZE];
+#endif
+// Nanos has no RAM for a second 1 KB buffer: requests stay in G_io_apdu_buffer, as before this
+// copy existed, so a command arriving during a user review can overwrite the pending request.
 
 typedef struct ctap2_data_t {
     union ctap2_data_u {

@@ -15,6 +15,8 @@
 #   limitations under the License.
 #*******************************************************************************/
 
+LDFLAGS += -Wl,--defsym,STACK_MIN_SIZE=0x100 -Wl,-Map,app.map
+
 ifeq ($(BOLOS_SDK),)
 $(error Environment variable BOLOS_SDK is not set)
 endif

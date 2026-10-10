@@ -34,7 +34,9 @@ bool u2fUxPending;
 uint8_t responseBuffer[IO_APDU_BUFFER_SIZE];
 #endif
 
+#ifndef TARGET_NANOS
 uint8_t ctap2RequestBuffer[IO_APDU_BUFFER_SIZE];
+#endif
 
 #include "string_utils.h"
 
