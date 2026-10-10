@@ -208,12 +208,17 @@ static int build_makeCred_authData(uint8_t *nonce, uint8_t *buffer, uint32_t buf
     return offset;
 }
 
-static int sign_and_build_makeCred_response(uint8_t *authData,
+/*
+ * Packed *self* attestation: no certificate (no "x5c"), the attestation signature is made with the
+ * private key of the new credential itself, over authData || clientDataHash, and "alg" is the
+ * algorithm of that credential.
+ */
+static int sign_and_build_makeCred_response(const uint8_t *nonce,
+                                            uint8_t *authData,
                                             uint32_t authDataLen,
                                             uint8_t *buffer,
                                             uint32_t bufferLen) {
     ctap2_register_data_t *ctap2RegisterData = globals_get_ctap2_register_data();
-    uint8_t hashData[CX_SHA256_SIZE];
     uint8_t attestationSignature[72];
     int status;
     uint32_t signatureLength;
@@ -227,13 +232,32 @@ static int sign_and_build_makeCred_response(uint8_t *authData,
     // an hash context that is heavy and can be avoided.
     memmove(authData + authDataLen, ctap2RegisterData->clientDataHash, CX_SHA256_SIZE);
 
-    cx_hash_sha256(authData, authDataLen + CX_SHA256_SIZE, hashData, sizeof(hashData));
+    {
+        // Use a new block scope to reduce the impact of privateKey on the stack.
+        cx_ecfp_private_key_t privateKey;
+        cx_curve_t bolosCurve = cose_alg_to_cx(ctap2RegisterData->coseAlgorithm);
 
-    status = crypto_sign_attestation(hashData, attestationSignature, true);
-    if (status < 0) {
-        return -1;
+        if (crypto_generate_private_key(nonce, &privateKey, bolosCurve) != 0) {
+            return -1;
+        }
+        if (ctap2RegisterData->coseAlgorithm == COSE_ALG_EDDSA) {
+            status = crypto_sign_application_eddsa(&privateKey,
+                                                   authData,
+                                                   authDataLen + CX_SHA256_SIZE,
+                                                   attestationSignature);
+        } else {
+            uint8_t hashData[CX_SHA256_SIZE];
+            cx_hash_sha256(authData, authDataLen + CX_SHA256_SIZE, hashData, sizeof(hashData));
+
+            status = crypto_sign_application(hashData, &privateKey, attestationSignature);
+        }
+        explicit_bzero(&privateKey, sizeof(privateKey));
+
+        if (status < 0) {
+            return -1;
+        }
+        signatureLength = status;
     }
-    signatureLength = status;
     PRINTF("Attestation signature %.*H\n", signatureLength, attestationSignature);
 
     // Build the response
@@ -248,17 +272,13 @@ static int sign_and_build_makeCred_response(uint8_t *authData,
     cbip_add_byte_string(&encoder, authData, authDataLen);
 
     cbip_add_int(&encoder, TAG_RESP_ATTSTMT);
-    cbip_add_map_header(&encoder, 3);
+    cbip_add_map_header(&encoder, 2);
 
     cbip_add_string(&encoder, TAG_ALGORITHM, sizeof(TAG_ALGORITHM) - 1);
-    cbip_add_int(&encoder, COSE_ALG_ES256);
+    cbip_add_int(&encoder, ctap2RegisterData->coseAlgorithm);
 
     cbip_add_string(&encoder, TAG_SIGNATURE, sizeof(TAG_SIGNATURE) - 1);
     cbip_add_byte_string(&encoder, attestationSignature, signatureLength);
-
-    cbip_add_string(&encoder, TAG_CERTIFICATE_X509, sizeof(TAG_CERTIFICATE_X509) - 1);
-    cbip_add_array_header(&encoder, 1);
-    cbip_add_byte_string(&encoder, FIDO2_ATTESTATION_CERT, sizeof(FIDO2_ATTESTATION_CERT));
 
     return encoder.offset;
 }
@@ -308,8 +328,9 @@ void ctap2_make_credential_confirm() {
         goto exit;
     }
 
-    // Compute standard attestation then build CBOR response
-    status = sign_and_build_makeCred_response(shared_ctx.sharedBuffer,
+    // Compute self attestation then build CBOR response
+    status = sign_and_build_makeCred_response(nonce,
+                                              shared_ctx.sharedBuffer,
                                               dataLen,
                                               responseBuffer + 1,
                                               CUSTOM_IO_APDU_BUFFER_SIZE - 1);

@@ -4,11 +4,11 @@ import os
 from base64 import b64decode
 from cryptography.hazmat.primitives import serialization
 from cryptography.x509 import load_pem_x509_certificate
-from fido2.attestation import AttestationVerifier
+from fido2.attestation import Attestation, AttestationType, AttestationVerifier
 from fido2.ctap import CtapDevice
 from fido2.ctap2.pin import ClientPin
 from pathlib import Path
-from ledgered.devices import Device, DeviceType
+from ledgered.devices import Device
 
 from ragger.backend import BackendInterface
 from ragger.navigator import Navigator, NavInsID, NavIns
@@ -133,12 +133,8 @@ class TestClient:
                 NavInsID.BOTH_CLICK
             ]
 
-            if self.ledger_device.type == DeviceType.NANOS:
-                # Screen 0 -> 5
-                instructions += [NavInsID.RIGHT_CLICK] * 5
-            else:
-                # Screen 0 -> 13
-                instructions += [NavInsID.RIGHT_CLICK] * 13
+            # Screen 0 -> 13
+            instructions += [NavInsID.RIGHT_CLICK] * 13
 
             instructions += [
                 NavInsID.BOTH_CLICK,
@@ -175,12 +171,10 @@ class TestClient:
                 # Enable and skip "Enabling" message
                 NavInsID.BOTH_CLICK
             ]
-            if self.ledger_device.type != DeviceType.NANOS:
-                # Screen 0 -> 5
-                instructions += [NavInsID.RIGHT_CLICK] * 5
-            else:
-                # Screen 0 -> 13
-                instructions += [NavInsID.RIGHT_CLICK] * 13
+
+            # Screen 0 -> 5
+            instructions += [NavInsID.RIGHT_CLICK] * 5
+
             instructions += [
                 NavInsID.BOTH_CLICK,
                 # Leave settings
@@ -201,3 +195,18 @@ class TestClient:
 
         self.navigator.navigate(instructions, screen_change_before_first_instruction=False)
         self.ctap2._info = self.ctap2.get_info()
+
+
+def verify_self_attestation(attestation, client_data_hash):
+    """
+    Registrations use packed self attestation: no certificate, the statement is signed with the
+    credential key. Verifies the signature and that no attestation certificate is present.
+    """
+    assert attestation.fmt == "packed"
+    assert "x5c" not in attestation.att_stmt
+    assert attestation.att_stmt["alg"] == attestation.auth_data.credential_data.public_key[3]
+
+    result = Attestation.for_type(attestation.fmt)().verify(attestation.att_stmt,
+                                                            attestation.auth_data,
+                                                            client_data_hash)
+    assert result.attestation_type == AttestationType.SELF

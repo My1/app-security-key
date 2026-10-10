@@ -20,9 +20,8 @@
 
 #include "make_credential_struct.h"
 
-#define TAG_ALGORITHM        "alg"
-#define TAG_SIGNATURE        "sig"
-#define TAG_CERTIFICATE_X509 "x5c"
+#define TAG_ALGORITHM "alg"
+#define TAG_SIGNATURE "sig"
 
 void ctap2_make_credential_confirm(void);
 void ctap2_make_credential_user_cancel(void);
