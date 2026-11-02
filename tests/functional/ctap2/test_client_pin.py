@@ -38,7 +38,7 @@ def raw_get_uv_token(client, protocol, **kwargs):
     key_agreement, _ = pin._get_shared_secret()
     return client.ctap2.client_pin(
         protocol.VERSION,
-        ClientPin.CMD.GET_PIN_UV_AUTH_TOKEN_USING_UV_WITH_PERMISSIONS,
+        ClientPin.CMD.GET_TOKEN_USING_UV,
         key_agreement=key_agreement,
         **kwargs)
 
@@ -57,8 +57,8 @@ def test_client_pin_get_uv_retries(client):
     ClientPin.CMD.GET_PIN_RETRIES,
     ClientPin.CMD.SET_PIN,
     ClientPin.CMD.CHANGE_PIN,
-    ClientPin.CMD.GET_PIN_TOKEN,
-    ClientPin.CMD.GET_PIN_UV_AUTH_TOKEN_USING_PIN_WITH_PERMISSIONS,
+    ClientPin.CMD.GET_TOKEN_USING_PIN_LEGACY,
+    ClientPin.CMD.GET_TOKEN_USING_PIN,
 ])
 def test_client_pin_no_pin_subcommands(client, subcommand):
     # No FIDO client PIN: all the PIN related subcommands are unsupported

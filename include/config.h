@@ -37,6 +37,9 @@ typedef struct config_t {
 #ifdef ENABLE_RK_CONFIG
     uint8_t rk_enabled;
 #endif
+    // 1: getInfo advertises "clientPin": true (there is no FIDO client PIN, Android needs it to
+    // use the built-in UV). 0 (default): not advertised.
+    uint8_t client_pin_advertised;
 } config_t;
 
 extern config_t const N_u2f_real;
@@ -51,6 +54,16 @@ void config_process_ctap2_reset(void);
 void config_set_ctap2_pin(uint8_t *pin);
 void config_decrease_ctap2_pin_retry_counter(void);
 void config_reset_ctap2_pin_retry_counter(void);
+
+// Backup ID: 8 lowercase hex digits (plus the terminating zero) identifying the seed, so that a
+// backup of the resident credentials can be matched with the device it belongs to. It is derived
+// from the CTAP2 wrapping key, the key that decides whether a backup can be restored.
+#define BACKUP_ID_SIZE 9
+void config_get_backup_id(char *out);
+
+// Setting: advertise "clientPin" in getInfo (off by default)
+void config_set_client_pin_advertised(bool advertised);
+bool config_get_client_pin_advertised(void);
 
 #ifdef ENABLE_RK_CONFIG
 void config_set_rk_enabled(bool enabled);

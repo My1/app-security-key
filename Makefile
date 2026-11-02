@@ -15,6 +15,9 @@
 #   limitations under the License.
 #*******************************************************************************/
 
+#force RK Config
+ENABLE_RK_CONFIG_UI_SETTING=1
+CFLAGS += -fstack-usage
 LDFLAGS += -Wl,--defsym,STACK_MIN_SIZE=0x100 -Wl,-Map,app.map
 
 ifeq ($(BOLOS_SDK),)
@@ -27,15 +30,15 @@ ifneq ($(TARGET_NAME),$(filter $(TARGET_NAME),TARGET_NANOS TARGET_NANOX TARGET_N
 $(error Environment variable TARGET_NAME is not valid or not supported)
 endif
 
-APPNAME = "Security Key"
+APPNAME = "Passkey"
 
 CURVE_APP_LOAD_PARAMS = secp256r1
 PATH_APP_LOAD_PARAMS = "5722689'"  # int("WRA".encode("ascii").hex(), 16)
 PATH_APP_LOAD_PARAMS += "5262163'"  # int("PKS".encode("ascii").hex(), 16)
 
 APPVERSION_M=1
-APPVERSION_N=7
-APPVERSION_P=7
+APPVERSION_N=0
+APPVERSION_P=0
 APPVERSION=$(APPVERSION_M).$(APPVERSION_N).$(APPVERSION_P)
 
 ICON_NANOS=icons/icon_security_key_nanos.gif
@@ -127,14 +130,14 @@ DEFINES += HAVE_BOLOS_APP_STACK_CANARY
 # This is necessary to never use the counter with a lower value than previous calls.
 # This means that the app APDU will be patched when streamed from the HSM and therefore
 # the apdu should not contain a crc.
-# For release build a special value marker is used to be patched by HSM in release binary.
-# For debug build a timestamp-based marker is used.
+# Default builds now use the build time, as that is what is the more likely case to happen
+# the HSM gets to use HSM_COUNTER_MARKER
 DEFINES += HAVE_COUNTER_MARKER
-ifneq ($(DEBUG), 0)
+ifeq ($(HSM_COUNTER_MARKER), 1)
+DEFINES += COUNTER_MARKER=0xF1D0C001
+else
 TIMESTAMP_HEX := $(shell printf '%08X' $$(date +%s))
 DEFINES += COUNTER_MARKER=0x${TIMESTAMP_HEX}
-else
-DEFINES += COUNTER_MARKER=0xF1D0C001
 endif
 
 ENABLE_NOCRC_APP_LOAD_PARAMS = 1

@@ -18,7 +18,11 @@ def test_fido_screens_settings(client, test_name):
         instructions.append(NavInsID.RIGHT_CLICK)
         # Screen 1 -> 2
         instructions.append(NavInsID.RIGHT_CLICK)
-        # Screen 2 -> 3
+        # Screen 2 -> 3 (backup ID)
+        instructions.append(NavInsID.RIGHT_CLICK)
+        # Screen 3 -> 4 (credits)
+        instructions.append(NavInsID.RIGHT_CLICK)
+        # Screen 4 -> 5 (settings)
         instructions.append(NavInsID.RIGHT_CLICK)
         # enter settings
         instructions.append(NavInsID.BOTH_CLICK)
@@ -39,7 +43,9 @@ def test_fido_screens_settings(client, test_name):
         instructions.append(NavInsID.BOTH_CLICK)
 
         # leave settings
-        # Screen 0 -> 1
+        # Screen 0 -> 1 (clientPin flag)
+        instructions.append(NavInsID.RIGHT_CLICK)
+        # Screen 1 -> 2 (back)
         instructions.append(NavInsID.RIGHT_CLICK)
         # confirm
         instructions.append(NavInsID.BOTH_CLICK)

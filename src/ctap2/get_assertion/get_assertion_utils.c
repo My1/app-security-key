@@ -463,7 +463,15 @@ static int build_and_encode_getAssertion_response(uint8_t *buffer,
     }
     // If RK: encoding credential info
     if (credData->residentKey) {
-        const bool encode_username = (!g.display_status && credData->userStr != NULL);
+        // The name / displayName only go to the platform when it has to choose between several
+        // accounts: the first answer with numberOfCredentials >= 2 and the getNextAssertion
+        // answers that follow it (get_next_assertion_enabled, only over NFC: over USB the user
+        // picks the account on the device). CTAP: "For single account per RP case,
+        // authenticator returns "id" field". Browsers (Chrome) show their own account picker for
+        // a single account that comes back with a name, an extra step other keys don't have.
+        const bool encode_username =
+            (!g.display_status && credData->userStr != NULL &&
+             ((ctap2AssertData->availableCredentials >= 2) || g.get_next_assertion_enabled));
         cbip_add_int(&encoder, TAG_RESP_USER);
         cbip_add_map_header(&encoder, encode_username ? 3 : 1);
         cbip_add_string(&encoder, KEY_USER_ID, sizeof(KEY_USER_ID) - 1);

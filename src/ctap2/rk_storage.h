@@ -22,6 +22,11 @@
 #define RK_STORAGE_FULL -2
 #define RK_NOT_FOUND    0
 
+// Layout of an NVM slot, see rk_storage.c
+#define RK_SLOT_SIZE           256
+#define RK_HEADER_SIZE         52
+#define RK_CREDENTIAL_MAX_SIZE (RK_SLOT_SIZE - RK_HEADER_SIZE)
+
 /**
  * Initialise the rk storage
  */
@@ -84,5 +89,26 @@ int rk_next_credential_from_RKList(uint16_t *idx,
                                    uint8_t **nonce,
                                    uint8_t **credential,
                                    uint32_t *credentialLen);
+
+/**
+ * Erase the resident credential with this RP ID hash and nonce, returns 1 if one was erased and 0
+ * if there is none.
+ */
+int rk_storage_erase_by_nonce(const uint8_t *rpIdHash, const uint8_t *nonce);
+
+/**
+ * Number of slots of the rk storage (maximum number of RKs).
+ */
+uint8_t rk_storage_capacity(void);
+
+/**
+ * Get a slot by its index: returns 1 and fills the (optional) outputs if the slot is used, 0
+ * otherwise. The pointers are into NVM and are only valid until the storage is modified.
+ */
+int rk_storage_get_slot(uint8_t slotIdx,
+                        uint8_t **rpIdHash,
+                        uint8_t **nonce,
+                        uint8_t **credential,
+                        uint32_t *credentialLen);
 
 #endif

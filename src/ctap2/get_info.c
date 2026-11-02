@@ -45,6 +45,9 @@
 #define OPTION_CLIENT_PIN           "clientPin"
 #define OPTION_LARGE_BLOBS          "largeBlobs"
 #define OPTION_PIN_UV_AUTH_TOKEN    "pinUvAuthToken"
+// Vendor option: the resident credential vendor command (0x50: backup ID, restore) exists (true
+// while resident keys are enabled, false otherwise)
+#define OPTION_VENDOR_RK_RESTORE    "ledgerMy1RkRestore"
 #define OPTION_SET_MIN_PIN_LENGTH   "setMinPINLength"
 #define OPTION_MAKE_CRED_WITHOUT_UV "makeCredUvNotRqd"
 #define OPTION_CRED_MGMT_PREVIEW    "credentialMgmtPreview"
@@ -57,7 +60,6 @@
 #define TRANSPORT_USB "usb"
 #define TRANSPORT_NFC "nfc"
 
-#define PUAT_ADVERTISE_CLIENT_PIN 1
 
 
 static void cbip_add_option(cbipEncoder_t *encoder,
@@ -128,11 +130,18 @@ void ctap2_get_info_handle(u2f_service_t *service, uint8_t *buffer, uint16_t len
     // Ordered correctly - see here:
     // https://fidoalliance.org/specs/fido-v2.2-rd-20241003/fido-client-to-authenticator-protocol-v2.2-rd-20241003.html#message-encoding
     cbip_add_int(&encoder, TAG_OPTIONS);
-#ifdef PUAT_ADVERTISE_CLIENT_PIN
-    cbip_add_map_header(&encoder, 6);
-#else
-    cbip_add_map_header(&encoder, 5);
-#endif
+    // rk, up, uv, plat, pinUvAuthToken, ledgerMy1RkRestore, plus clientPin and credMgmt when
+    // advertised
+    {
+        uint8_t optionCount = 6;
+        if (config_get_client_pin_advertised()) {
+            optionCount++;
+        }
+        if (CTAP2_RK_ENABLED()) {
+            optionCount++;
+        }
+        cbip_add_map_header(&encoder, optionCount);
+    }
 #ifdef ENABLE_RK_CONFIG
     cbip_add_option(&encoder,
                     OPTION_RESIDENT_KEY,
@@ -149,22 +158,33 @@ void ctap2_get_info_handle(u2f_service_t *service, uint8_t *buffer, uint16_t len
                     sizeof(OPTION_USER_VERIFICATION) - 1,
                     true);
     cbip_add_option(&encoder, OPTION_PLAT, sizeof(OPTION_PLAT) - 1, false);
-#ifdef PUAT_ADVERTISE_CLIENT_PIN
-    // Play Services (Android) only takes its pinUvAuthToken / built-in UV path when "clientPin" is
-    // advertised as true. There is no FIDO PIN on this authenticator: the PIN subcommands answer
-    // UNSUPPORTED_OPTION, and since "uv" is true platforms use built-in UV instead of asking for
-    // a PIN. Side effects to watch for: platforms that insist on PIN UV, and tools that query
-    // the PIN retries (fido2-token -I).
-    cbip_add_option(&encoder, OPTION_CLIENT_PIN, sizeof(OPTION_CLIENT_PIN) - 1, true);
-#endif
+    // Credential management of the resident keys, only while they are enabled in the settings
+    // (the cm permission is refused otherwise). Canonical order: "credMgmt" (8 chars) sorts
+    // before "clientPin" (9) and "pinUvAuthToken" (14).
+    if (CTAP2_RK_ENABLED()) {
+        cbip_add_option(&encoder, OPTION_CRED_MGMT, sizeof(OPTION_CRED_MGMT) - 1, true);
+    }
+    // Setting, off by default: Play Services (Android) only takes its pinUvAuthToken / built-in UV
+    // path when "clientPin" is advertised as true. There is no FIDO PIN on this authenticator:
+    // the PIN subcommands answer UNSUPPORTED_OPTION, and since "uv" is true platforms use
+    // built-in UV instead of asking for a PIN. Side effects to watch for when on: platforms that
+    // insist on PIN UV, and tools that query the PIN retries (fido2-token -I).
+    if (config_get_client_pin_advertised()) {
+        cbip_add_option(&encoder, OPTION_CLIENT_PIN, sizeof(OPTION_CLIENT_PIN) - 1, true);
+    }
     // pinUvAuthToken: getPinUvAuthTokenUsingUvWithPermissions is supported (mc and ga permissions)
     cbip_add_option(&encoder,
                     OPTION_PIN_UV_AUTH_TOKEN,
                     sizeof(OPTION_PIN_UV_AUTH_TOKEN) - 1,
                     true);
+    // Vendor: resident credential restore (cred_mgmt.c). Always listed so that tools know the
+    // firmware has it, true only while it can be used. Canonical order: the longest key, last.
+    cbip_add_option(&encoder,
+                    OPTION_VENDOR_RK_RESTORE,
+                    sizeof(OPTION_VENDOR_RK_RESTORE) - 1,
+                    CTAP2_RK_ENABLED());
     /*
     cbip_add_option(&encoder, OPTION_ALWAYS_UV, sizeof(OPTION_ALWAYS_UV) - 1, false);
-    cbip_add_option(&encoder, OPTION_CRED_MGMT, sizeof(OPTION_CRED_MGMT) - 1, true);
     cbip_add_option(&encoder, OPTION_AUTHN_CFG, sizeof(OPTION_AUTHN_CFG) - 1, true);
     cbip_add_option(&encoder,
                     OPTION_LARGE_BLOBS, sizeof(OPTION_LARGE_BLOBS) - 1, true);

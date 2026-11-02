@@ -35,6 +35,7 @@
 #define TAG_HANDLE_COSE_ALGORITHM 3
 #define TAG_HANDLE_USERID         4
 #define TAG_HANDLE_USERNAME       5
+#define TAG_HANDLE_RPID           6
 
 // Handle versions (inner version, inside the encrypted CBOR; not to be confused with the
 // CREDENTIAL_VERSION_* byte at the start of the credId):
@@ -48,10 +49,11 @@
 #define FLAG_RK         0x01
 #define FLAG_NO_COUNTER 0x02
 
-static int credential_encode(credential_data_t *credData,
-                             uint8_t *buffer,
-                             uint32_t bufferLen,
-                             bool fullCredentials) {
+static int credential_encode_ex(credential_data_t *credData,
+                                uint8_t *buffer,
+                                uint32_t bufferLen,
+                                bool fullCredentials,
+                                bool withRpId) {
     cbipEncoder_t encoder;
     uint8_t mapSize;
     uint32_t flags = 0;
@@ -61,6 +63,9 @@ static int credential_encode(credential_data_t *credData,
         mapSize++;
         if (credData->userStr != NULL) {
             mapSize++;  // can find a real name
+        }
+        if (withRpId) {
+            mapSize++;
         }
     }
 
@@ -92,6 +97,11 @@ static int credential_encode(credential_data_t *credData,
             cbip_add_int(&encoder, TAG_HANDLE_USERNAME);
             cbip_add_string(&encoder, credData->userStr, credData->userStrLen);
         }
+
+        if (withRpId) {
+            cbip_add_int(&encoder, TAG_HANDLE_RPID);
+            cbip_add_string(&encoder, credData->rpId, credData->rpIdLen);
+        }
     }
 
     if (encoder.fault) {
@@ -100,6 +110,28 @@ static int credential_encode(credential_data_t *credData,
     }
 
     return encoder.offset;
+}
+
+static int credential_encode(credential_data_t *credData,
+                             uint8_t *buffer,
+                             uint32_t bufferLen,
+                             bool fullCredentials) {
+    // The RP ID is stored with resident credentials so that credential management can name the
+    // RP (only its hash is otherwise known). It is optional: when it does not fit in an RK slot
+    // next to the user information, the credential is stored without it.
+    bool withRpId = fullCredentials && credData->residentKey && (credData->rpId != NULL) &&
+                    (credData->rpIdLen > 0);
+    int status = credential_encode_ex(credData, buffer, bufferLen, fullCredentials, withRpId);
+
+    if (withRpId && ((status < 0) || (status > RK_CREDENTIAL_MAX_SIZE))) {
+        PRINTF("RP ID does not fit in the RK slot, not stored\n");
+        status = credential_encode_ex(credData, buffer, bufferLen, fullCredentials, false);
+    }
+    return status;
+}
+
+int credential_encode_resident(credential_data_t *credData, uint8_t *buffer, uint32_t bufferLen) {
+    return credential_encode(credData, buffer, bufferLen, true);
 }
 
 int credential_decode(credential_data_t *credData,
@@ -190,6 +222,19 @@ int credential_decode(credential_data_t *credData,
         if (status < CBIPH_STATUS_NOT_FOUND) {
             PRINTF("Invalid credential username\n");
             return -1;
+        }
+
+        if (version >= CTAP2_HANDLE_VERSION_2) {
+            // Optional RP ID (resident credentials only)
+            status = cbiph_get_map_key_text(&decoder,
+                                            &mapItem,
+                                            TAG_HANDLE_RPID,
+                                            &credData->rpId,
+                                            &credData->rpIdLen);
+            if (status < CBIPH_STATUS_NOT_FOUND) {
+                PRINTF("Invalid credential rpId\n");
+                return -1;
+            }
         }
     }
 

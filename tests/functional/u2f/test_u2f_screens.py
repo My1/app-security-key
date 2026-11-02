@@ -24,15 +24,28 @@ def test_u2f_screens_idle(client, test_name, device: Device, rk_config_ui):
         instructions.append(NavInsID.RIGHT_CLICK)
         # Screen 2 -> 3
         instructions.append(NavInsID.RIGHT_CLICK)
+        # Screen 3 -> 4
+        instructions.append(NavInsID.RIGHT_CLICK)
 
         if rk_config_ui:
-            # Screen 3 -> 4
+            # Screen 4 -> 5
             instructions.append(NavInsID.RIGHT_CLICK)
     else:
-        instructions = [
-            NavInsID.USE_CASE_HOME_SETTINGS,
-            NavInsID.USE_CASE_SETTINGS_MULTI_PAGE_EXIT
-        ]
+        if rk_config_ui:
+            instructions = [
+                NavInsID.USE_CASE_HOME_SETTINGS,
+                NavInsID.USE_CASE_SETTINGS_NEXT,
+                NavInsID.USE_CASE_SETTINGS_NEXT,
+                NavInsID.USE_CASE_SETTINGS_NEXT,
+                NavInsID.USE_CASE_SETTINGS_MULTI_PAGE_EXIT
+            ]
+        else:
+            instructions = [
+                NavInsID.USE_CASE_HOME_SETTINGS,
+                NavInsID.USE_CASE_SETTINGS_NEXT,
+                NavInsID.USE_CASE_SETTINGS_NEXT,
+                NavInsID.USE_CASE_SETTINGS_MULTI_PAGE_EXIT
+            ]
 
     if rk_config_ui:
         test_name += "_rk_config_ui"

@@ -65,4 +65,6 @@ typedef enum ctap2_ux_state_e {
     CTAP2_UX_STATE_MULTIPLE_ASSERTION,
     CTAP2_UX_STATE_NO_ASSERTION,
     CTAP2_UX_STATE_RESET,
+    CTAP2_UX_STATE_DELETE_CRED,
+    CTAP2_UX_STATE_CM_AUTH,
 } ctap2_ux_state_t;

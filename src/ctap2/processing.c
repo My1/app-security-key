@@ -35,6 +35,10 @@
 #define CBOR_MAKE_CREDENTIAL    0x01
 #define CBOR_GET_ASSERTION      0x02
 #define CBOR_GET_NEXT_ASSERTION 0x08
+#define CBOR_CRED_MGMT          0x0A
+// Vendor (0x40 - 0xBF, avoiding 0x40 / 0x41 of CTAP 2.1 PRE): resident credential backup ID and
+// restore, see cred_mgmt.c
+#define CBOR_VENDOR_RK 0x50
 #define CBOR_GET_INFO           0x04
 #define CBOR_CLIENT_PIN         0x06
 #define CBOR_RESET              0x07
@@ -45,6 +49,14 @@ void ctap2_handle_cmd_cbor(u2f_service_t *service, uint8_t *buffer, uint16_t len
 
     if (length < 1) {
         send_cbor_error(service, ERROR_INVALID_CBOR);
+        return;
+    }
+
+    // While the user approves a credential management token, the token waits in RAM shared with
+    // the other PIN/UV commands: only getInfo (which does not touch it) can be answered
+    if ((ctap2UxState == CTAP2_UX_STATE_CM_AUTH) && (buffer[0] != CBOR_GET_INFO)) {
+        PRINTF("CBOR command refused: credential management approval pending\n");
+        send_cbor_error(service, ERROR_OPERATION_PENDING);
         return;
     }
 
@@ -108,6 +120,12 @@ void ctap2_handle_cmd_cbor(u2f_service_t *service, uint8_t *buffer, uint16_t len
         case CBOR_RESET:
             ctap2_reset_handle(service, buffer + 1, length - 1);
             break;
+        case CBOR_CRED_MGMT:
+            ctap2_cred_mgmt_handle(service, buffer + 1, length - 1, false);
+            break;
+        case CBOR_VENDOR_RK:
+            ctap2_cred_mgmt_handle(service, buffer + 1, length - 1, true);
+            break;
         default:
             send_cbor_error(service, ERROR_INVALID_CBOR);
             break;
@@ -122,6 +140,12 @@ void ctap2_handle_cmd_cancel(u2f_service_t *service, uint8_t *buffer, uint16_t l
     if (ctap2UxState != CTAP2_UX_STATE_NONE) {
         PRINTF("Cancel pending UI\n");
 
+        if (ctap2UxState == CTAP2_UX_STATE_CM_AUTH) {
+            // Forget the token that was waiting for the approval (it also answers, see below)
+            ctap2_client_pin_cm_auth_discard();
+        } else if (ctap2UxState == CTAP2_UX_STATE_DELETE_CRED) {
+            ctap2_cred_mgmt_delete_discard();
+        }
         ctap2UxState = CTAP2_UX_STATE_NONE;
 
         // Answer as fast as possible as Chrome expect a fast answer and in case

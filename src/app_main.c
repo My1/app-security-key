@@ -28,6 +28,7 @@
 #include "ui_shared.h"
 #include "ctap2.h"
 #include "rk_storage.h"
+#include "cred_mgmt_ui.h"
 
 /**
  * Override app_ticker_event_callback io_event() dummy implementation
@@ -36,6 +37,7 @@ void app_ticker_event_callback(void) {
     if (ctap2UxState != CTAP2_UX_STATE_NONE) {
         u2f_transport_ctap2_send_keepalive(&G_io_u2f, KEEPALIVE_REASON_TUP_NEEDED);
     }
+    ctap2_cred_mgmt_ux_tick();
 #ifdef HAVE_NFC
     nfc_idle_work();
     nfc_idle_work2();

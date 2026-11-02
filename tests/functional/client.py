@@ -8,7 +8,7 @@ from fido2.attestation import Attestation, AttestationType, AttestationVerifier
 from fido2.ctap import CtapDevice
 from fido2.ctap2.pin import ClientPin
 from pathlib import Path
-from ledgered.devices import Device
+from ledgered.devices import Device, DeviceType
 
 from ragger.backend import BackendInterface
 from ragger.navigator import Navigator, NavInsID, NavIns
@@ -124,7 +124,9 @@ class TestClient:
     def activate_rk_option(self):
         if self.ledger_device.is_nano:
             instructions = [
-                # Enter in the settings
+                # Enter in the settings: home, description, version, backup ID, credits settings
+                NavInsID.RIGHT_CLICK,
+                NavInsID.RIGHT_CLICK,
                 NavInsID.RIGHT_CLICK,
                 NavInsID.RIGHT_CLICK,
                 NavInsID.RIGHT_CLICK,
@@ -138,7 +140,8 @@ class TestClient:
 
             instructions += [
                 NavInsID.BOTH_CLICK,
-                # Leave settings
+                # Leave settings: resident keys, clientPin flag, back
+                NavInsID.RIGHT_CLICK,
                 NavInsID.RIGHT_CLICK,
                 NavInsID.BOTH_CLICK
             ]
@@ -163,7 +166,9 @@ class TestClient:
 
         if self.ledger_device.is_nano:
             instructions = [
-                # Enter in the settings
+                # Enter in the settings: home, description, version, backup ID, credits, settings
+                NavInsID.RIGHT_CLICK,
+                NavInsID.RIGHT_CLICK,
                 NavInsID.RIGHT_CLICK,
                 NavInsID.RIGHT_CLICK,
                 NavInsID.RIGHT_CLICK,
@@ -172,12 +177,17 @@ class TestClient:
                 NavInsID.BOTH_CLICK
             ]
 
-            # Screen 0 -> 5
-            instructions += [NavInsID.RIGHT_CLICK] * 5
+            # Through the warning to "Enable": its text is paged on 13 screens on the Nano S
+            # (smaller font), 5 on the others
+            if self.ledger_device.type == DeviceType.NANOS:
+                instructions += [NavInsID.RIGHT_CLICK] * 13
+            else:
+                instructions += [NavInsID.RIGHT_CLICK] * 5
 
             instructions += [
                 NavInsID.BOTH_CLICK,
-                # Leave settings
+                # Leave settings: resident keys, clientPin flag, back
+                NavInsID.RIGHT_CLICK,
                 NavInsID.RIGHT_CLICK,
                 NavInsID.BOTH_CLICK
             ]

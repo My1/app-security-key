@@ -28,6 +28,7 @@
 #include "cose_keys.h"
 #include "crypto.h"
 #include "globals.h"
+#include "cred_mgmt_ui.h"
 
 /*
  * authenticatorClientPIN, reduced to what a PIN-less, built-in-UV authenticator needs.
@@ -79,10 +80,28 @@ static cx_ecfp_private_key_t ctap2KeyAgreement;
 // static functions called once get inlined, which would put all of these in the frame of
 // ctap2_client_pin_handle() for every subcommand. Only one CTAP2 command is processed at a
 // time and every user wipes them with explicit_bzero() after use.
-static uint8_t cryptScratch[PIN_UV_CRYPT_MAX_SIZE];
-static cx_aes_key_t cryptAesKey;
-static uint8_t uvSharedSecret[SHARED_SECRET_MAX_SIZE];
-static uint8_t uvTokenEnc[AUTH_TOKEN_MAX_ENC_SIZE];
+//
+// The same RAM is lent to credential management (ctap2_shared_scratch()), which never runs at
+// the same time as the PIN/UV crypto: RAM is the scarce resource on the Nano S.
+static union {
+    struct {
+        uint8_t cryptScratch[PIN_UV_CRYPT_MAX_SIZE];
+        cx_aes_key_t cryptAesKey;
+        uint8_t uvSharedSecret[SHARED_SECRET_MAX_SIZE];
+        uint8_t uvTokenEnc[AUTH_TOKEN_MAX_ENC_SIZE];
+    } pin;
+    uint8_t shared[CTAP2_SHARED_SCRATCH_SIZE];
+} scratch;
+#define cryptScratch   scratch.pin.cryptScratch
+#define cryptAesKey    scratch.pin.cryptAesKey
+#define uvSharedSecret scratch.pin.uvSharedSecret
+#define uvTokenEnc     scratch.pin.uvTokenEnc
+
+_Static_assert(sizeof(scratch.pin) >= CTAP2_SHARED_SCRATCH_SIZE, "shared scratch fits");
+
+uint8_t *ctap2_shared_scratch(void) {
+    return scratch.shared;
+}
 
 /******************************************/
 /*     PIN/UV Auth Protocol functions     */
@@ -365,6 +384,46 @@ static void invalidate_token(void) {
     explicit_bzero(&authToken, sizeof(authToken));
 }
 
+int ctap2_client_pin_verify_cm(int protocol,
+                               const uint8_t *msg,
+                               uint32_t msgLength,
+                               const uint8_t *msg2,
+                               uint32_t msg2Length,
+                               const uint8_t *signature,
+                               uint32_t signatureLength,
+                               const uint8_t *rpIdHash) {
+    if (!authToken.inUse || (protocol != authToken.protocol)) {
+        return ERROR_PIN_AUTH_INVALID;
+    }
+
+    if (!ctap2_client_pin_verify(protocol,
+                                 authToken.value,
+                                 authToken.length,
+                                 msg,
+                                 msgLength,
+                                 (msg2Length > 0) ? msg2 : NULL,
+                                 msg2Length,
+                                 signature,
+                                 signatureLength)) {
+        return ERROR_PIN_AUTH_INVALID;
+    }
+
+    if ((authToken.permissions & PUAT_PERM_CM) == 0) {
+        PRINTF("pinUvAuthToken lacks the cm permission\n");
+        return ERROR_PIN_AUTH_INVALID;
+    }
+    if ((rpIdHash != NULL) && authToken.hasRpId &&
+        (memcmp(authToken.rpIdHash, rpIdHash, RP_ID_HASH_SIZE) != 0)) {
+        PRINTF("pinUvAuthToken bound to another RP ID\n");
+        return ERROR_PIN_AUTH_INVALID;
+    }
+    return ERROR_NONE;
+}
+
+bool ctap2_client_pin_token_allows_rp(const uint8_t *rpIdHash) {
+    return !authToken.hasRpId || (memcmp(authToken.rpIdHash, rpIdHash, RP_ID_HASH_SIZE) == 0);
+}
+
 void ctap2_client_pin_clear_permission(uint8_t permission) {
     authToken.permissions &= ~permission;
 }
@@ -463,6 +522,21 @@ __attribute__((noinline)) static void ctap2_handle_get_uv_retries(u2f_service_t 
     send_cbor_response(service, 1 + encoder.offset, NULL);
 }
 
+// Length of the encrypted token waiting for the user's approval (0: none)
+static uint8_t pendingTokenEncLen;
+
+static void send_token_response(const uint8_t *tokenEnc, uint32_t tokenEncLen) {
+    cbipEncoder_t encoder;
+
+    cbip_encoder_init(&encoder, responseBuffer + 1, CUSTOM_IO_APDU_BUFFER_SIZE - 1);
+    cbip_add_map_header(&encoder, 1);
+    cbip_add_int(&encoder, TAG_RESP_PIN_TOKEN);
+    cbip_add_byte_string(&encoder, tokenEnc, tokenEncLen);
+
+    responseBuffer[0] = ERROR_NONE;
+    send_cbor_response(&G_io_u2f, 1 + encoder.offset, NULL);
+}
+
 __attribute__((noinline)) static void ctap2_handle_get_uv_token(u2f_service_t *service,
                                       cbipDecoder_t *decoder,
                                       cbipItem_t *mapItem,
@@ -474,7 +548,6 @@ __attribute__((noinline)) static void ctap2_handle_get_uv_token(u2f_service_t *s
     uint8_t *sharedSecret = uvSharedSecret;
     uint8_t *tokenEnc = uvTokenEnc;
     uint32_t tokenEncLen;
-    cbipEncoder_t encoder;
 
     PRINTF("client_pin_get_uv_token\n");
 
@@ -502,13 +575,31 @@ __attribute__((noinline)) static void ctap2_handle_get_uv_token(u2f_service_t *s
         goto end;
     }
 
-    // rpId, mandatory for mc / ga
-    status = cbiph_get_map_key_text(decoder, mapItem, TAG_RP_ID, &rpId, &rpIdLen);
-    if (status == CBIPH_STATUS_NOT_FOUND) {
-        send_cbor_error(service, ERROR_MISSING_PARAMETER);
+    // Credential management is only offered while resident keys are enabled in the settings
+    if (((permissions & PUAT_PERM_CM) != 0) && !CTAP2_RK_ENABLED()) {
+        PRINTF("cm permission denied: resident keys are disabled\n");
+        send_cbor_error(service, ERROR_UNAUTHORIZED_PERMISSION);
         goto end;
     }
-    if (status != CBIPH_STATUS_FOUND) {
+
+    if (((permissions & PUAT_PERM_CM) != 0) &&
+        (CMD_IS_OVER_U2F_NFC || (ctap2UxState != CTAP2_UX_STATE_NONE) || u2fUxPending)) {
+        // The user can't answer over NFC, nor while another confirmation is pending
+        PRINTF("cm permission denied: user can't confirm now\n");
+        send_cbor_error(service, CMD_IS_OVER_U2F_NFC ? ERROR_OPERATION_DENIED
+                                                     : ERROR_OPERATION_PENDING);
+        goto end;
+    }
+
+    // rpId, mandatory for mc / ga, optional for cm
+    status = cbiph_get_map_key_text(decoder, mapItem, TAG_RP_ID, &rpId, &rpIdLen);
+    if (status == CBIPH_STATUS_NOT_FOUND) {
+        if ((permissions & (PUAT_PERM_MC | PUAT_PERM_GA)) != 0) {
+            send_cbor_error(service, ERROR_MISSING_PARAMETER);
+            goto end;
+        }
+        rpId = NULL;
+    } else if (status != CBIPH_STATUS_FOUND) {
         send_cbor_error(service, cbiph_map_cbor_error(status));
         goto end;
     }
@@ -525,9 +616,10 @@ __attribute__((noinline)) static void ctap2_handle_get_uv_token(u2f_service_t *s
         (protocol == PIN_PROTOCOL_VERSION_V1) ? AUTH_TOKEN_V1_SIZE : AUTH_TOKEN_V2_SIZE;
     cx_rng_no_throw(authToken.value, authToken.length);
     authToken.permissions = (uint8_t) permissions;
-    cx_hash_sha256((const uint8_t *) rpId, rpIdLen, authToken.rpIdHash, RP_ID_HASH_SIZE);
-    authToken.hasRpId = true;
-    authToken.inUse = true;
+    if (rpId != NULL) {
+        cx_hash_sha256((const uint8_t *) rpId, rpIdLen, authToken.rpIdHash, RP_ID_HASH_SIZE);
+        authToken.hasRpId = true;
+    }
 
     if (ctap2_client_pin_encrypt(protocol,
                                  sharedSecret,
@@ -540,17 +632,43 @@ __attribute__((noinline)) static void ctap2_handle_get_uv_token(u2f_service_t *s
         goto end;
     }
 
-    cbip_encoder_init(&encoder, responseBuffer + 1, CUSTOM_IO_APDU_BUFFER_SIZE - 1);
-    cbip_add_map_header(&encoder, 1);
-    cbip_add_int(&encoder, TAG_RESP_PIN_TOKEN);
-    cbip_add_byte_string(&encoder, tokenEnc, tokenEncLen);
+    if ((permissions & PUAT_PERM_CM) != 0) {
+        // Credential management exposes and deletes the user's accounts: the user has to approve
+        // it on the device. The token is ready but not valid yet, and its encrypted form stays in
+        // the scratch buffer until the answer (other commands are refused meanwhile, see
+        // processing.c). The shared secret is not needed anymore.
+        pendingTokenEncLen = (uint8_t) tokenEncLen;
+        explicit_bzero(uvSharedSecret, sizeof(uvSharedSecret));
+        ctap2_cred_mgmt_auth_ux();
+        return;
+    }
 
-    responseBuffer[0] = ERROR_NONE;
-    send_cbor_response(&G_io_u2f, 1 + encoder.offset, NULL);
+    authToken.inUse = true;
+    send_token_response(tokenEnc, tokenEncLen);
 
 end:
     explicit_bzero(uvSharedSecret, sizeof(uvSharedSecret));
     explicit_bzero(uvTokenEnc, sizeof(uvTokenEnc));
+}
+
+void ctap2_client_pin_cm_auth_confirm(void) {
+    authToken.inUse = true;
+    send_token_response(uvTokenEnc, pendingTokenEncLen);
+    explicit_bzero(uvTokenEnc, sizeof(uvTokenEnc));
+    pendingTokenEncLen = 0;
+}
+
+void ctap2_client_pin_cm_auth_discard(void) {
+    invalidate_token();
+    explicit_bzero(uvTokenEnc, sizeof(uvTokenEnc));
+    pendingTokenEncLen = 0;
+}
+
+void ctap2_client_pin_cm_auth_cancel(void) {
+    invalidate_token();
+    explicit_bzero(uvTokenEnc, sizeof(uvTokenEnc));
+    pendingTokenEncLen = 0;
+    send_cbor_error(&G_io_u2f, ERROR_OPERATION_DENIED);
 }
 
 /******************************************/
@@ -620,4 +738,5 @@ void ctap2_client_pin_handle(u2f_service_t *service, uint8_t *buffer, uint16_t l
 void ctap2_client_pin_reset_ctx(void) {
     ctap2_client_pin_regenerate();
     invalidate_token();
+    ctap2_cred_mgmt_reset_ctx();
 }

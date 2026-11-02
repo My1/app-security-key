@@ -34,11 +34,13 @@ typedef struct __attribute__((__packed__)) rk_header_s {
     uint16_t idx;  // used as "age" (increases only)
 } rk_header_t;
 
-#define SLOT_SIZE 256
+#define SLOT_SIZE RK_SLOT_SIZE
 // Currently 24 on all devices, except NanoS which only allows 8
 #define CREDENTIAL_MAX_NUMBER (RK_SIZE / SLOT_SIZE)
 #define CREDENTIAL_MAX_SIZE   (SLOT_SIZE - sizeof(rk_header_t))
 CCASSERT("credentialLen should fit in an uint8_t", CREDENTIAL_MAX_SIZE <= 0xFF);
+CCASSERT("rk header size", sizeof(rk_header_t) == RK_HEADER_SIZE);
+CCASSERT("rk credential max size", CREDENTIAL_MAX_SIZE == RK_CREDENTIAL_MAX_SIZE);
 
 typedef struct __attribute__((__packed__)) rk_slot_s {
     rk_header_t header;
@@ -360,4 +362,49 @@ int rk_next_credential_from_RKList(uint16_t *idx,
         *credentialLen = slot->header.credentialLen;
     }
     return 1;
+}
+
+uint8_t rk_storage_capacity(void) {
+    return CREDENTIAL_MAX_NUMBER;
+}
+
+int rk_storage_get_slot(uint8_t slotIdx,
+                        uint8_t **rpIdHash,
+                        uint8_t **nonce,
+                        uint8_t **credential,
+                        uint32_t *credentialLen) {
+    rk_slot_t *slot = get_slot_addr(slotIdx);
+
+    if ((slot == NULL) || SLOT_IS_UNUSED(slot)) {
+        return 0;
+    }
+    if (rpIdHash != NULL) {
+        *rpIdHash = slot->header.rpIdHash;
+    }
+    if (nonce != NULL) {
+        *nonce = slot->header.nonce;
+    }
+    if (credential != NULL) {
+        *credential = slot->credential;
+    }
+    if (credentialLen != NULL) {
+        *credentialLen = slot->header.credentialLen;
+    }
+    return 1;
+}
+
+int rk_storage_erase_by_nonce(const uint8_t *rpIdHash, const uint8_t *nonce) {
+    for (uint8_t i = 0; i < CREDENTIAL_MAX_NUMBER; i++) {
+        rk_slot_t *slot = get_slot_addr(i);
+
+        if ((slot == NULL) || SLOT_IS_UNUSED(slot)) {
+            continue;
+        }
+        if (crypto_compare(slot->header.rpIdHash, rpIdHash, RP_ID_HASH_SIZE) &&
+            crypto_compare(slot->header.nonce, nonce, CREDENTIAL_NONCE_SIZE)) {
+            erase_slot(i);
+            return 1;
+        }
+    }
+    return 0;
 }

@@ -41,13 +41,18 @@ static void app_quit(void) {
 
 #ifdef ENABLE_RK_CONFIG_UI_SETTING
 static uint8_t initSettingPage;
-static nbgl_layoutSwitch_t switches[1] = {0};
+// Resident keys, clientPin advertisement
+#define NB_SWITCHES 2
+static nbgl_layoutSwitch_t switches[NB_SWITCHES] = {0};
 #endif  // ENABLE_RK_CONFIG_UI_SETTING
-static const char *const INFO_TYPES[] = {"Version", "Developer", "Copyright"};
-static const char *const INFO_CONTENTS[] = {APPVERSION, "Ledger", "(c) 2022-2026 Ledger"};
+// The backup ID identifies the seed, to match backups of the resident credentials with this
+// device (rk_backup.py stores it in the backup file). Computed by ui_idle().
+static char backupId[BACKUP_ID_SIZE];
+static const char *const INFO_TYPES[] = {"Version", "Backup ID", "Reworked by", "Original by"};
+static const char *const INFO_CONTENTS[] = {APPVERSION, backupId, "My1", "(c) 2022-2026 Ledger"};
 
 static const nbgl_contentInfoList_t infoList = {
-    .nbInfos = 3,
+    .nbInfos = 4,
     .infoTypes = INFO_TYPES,
     .infoContents = INFO_CONTENTS,
 };
@@ -57,7 +62,7 @@ static const nbgl_contentInfoList_t infoList = {
 static void controls_callback(int token, uint8_t index, int page);
 
 static const nbgl_content_t contents[1] = {{.type = SWITCHES_LIST,
-                                            .content.switchesList.nbSwitches = 1,
+                                            .content.switchesList.nbSwitches = NB_SWITCHES,
                                             .content.switchesList.switches = switches,
                                             .contentActionCallback = controls_callback}};
 
@@ -67,6 +72,7 @@ static const nbgl_genericContents_t settingContents = {.callbackCallNeeded = fal
 
 static void ui_back_from_menu_choice(void) {
     switches[0].initState = config_get_rk_enabled();
+    switches[1].initState = config_get_client_pin_advertised();
     nbgl_useCaseHomeAndSettings(
         APPNAME,
         &ICON_APP_SECURITY,
@@ -105,7 +111,11 @@ static void controls_callback(int token, uint8_t index, int page) {
                                warning_choice);
         }
     }
+    if (token == FIRST_USER_TOKEN + 1) {
+        config_set_client_pin_advertised(!config_get_client_pin_advertised());
+    }
     switches[0].initState = config_get_rk_enabled();
+    switches[1].initState = config_get_client_pin_advertised();
 }
 #endif  // ENABLE_RK_CONFIG_UI_SETTING
 
@@ -145,6 +155,8 @@ static nbgl_homeAction_t homeNoNFCWarning = {};
 void ui_idle(void) {
     nbgl_homeAction_t *home_button = NULL;
 
+    config_get_backup_id(backupId);
+
 #ifdef HAVE_NFC
     bool nfc_enabled;
     nfc_enabled = os_setting_get(OS_SETTING_FEATURES, NULL, 0) & OS_SETTING_FEATURES_NFC_ENABLED;
@@ -171,6 +183,17 @@ void ui_idle(void) {
     switches[0].token = FIRST_USER_TOKEN;
     switches[0].tuneId = TUNE_TAP_CASUAL;
     switches[0].initState = config_get_rk_enabled();
+    switches[1].text = "clientPin flag";
+    switches[1].subText =
+        "Reports a FIDO client PIN to\n"
+        "the computer or phone. There\n"
+        "is none: the device unlock is\n"
+        "the user verification. Android\n"
+        "needs it to use passkeys with\n"
+        "this app.";
+    switches[1].token = FIRST_USER_TOKEN + 1;
+    switches[1].tuneId = TUNE_TAP_CASUAL;
+    switches[1].initState = config_get_client_pin_advertised();
 #endif  //  ENABLE_RK_CONFIG_UI_SETTING
     nbgl_useCaseHomeAndSettings(
         APPNAME,

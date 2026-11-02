@@ -19,6 +19,7 @@
 #if defined(HAVE_BAGL)
 
 #include <os.h>
+#include <string.h>
 #ifndef TARGET_NANOS
 #include <main_std_app.h>
 #else
@@ -33,6 +34,7 @@ static void app_quit(void) {
 }
 
 #include "config.h"
+#include "globals.h"
 #include "ui_shared.h"
 
 #ifdef ENABLE_RK_CONFIG_UI_SETTING
@@ -40,6 +42,7 @@ static void app_quit(void) {
 static void display_warning();
 static void display_settings();
 static void toggle_settings();
+static void toggle_client_pin();
 
 UX_STEP_NOCB(ux_settings_enabling_flow_warning_step,
              bn_paging,
@@ -96,6 +99,16 @@ UX_STEP_CB(ux_settings_flow_1_enabled_step, bn, toggle_settings(), {"Resident ke
 
 UX_STEP_CB(ux_settings_flow_1_disabled_step, bn, display_warning(), {"Resident keys", "Disabled"});
 
+// "clientPin" advertised in getInfo (needed by Android for the built-in UV), its state is written
+// in g.buffer_20 by display_settings()
+UX_STEP_CB(ux_settings_flow_client_pin_step,
+           bn,
+           toggle_client_pin(),
+           {
+               "clientPin flag",
+               g.buffer_20,
+           });
+
 UX_STEP_CB(ux_settings_flow_2_step,
            pb,
            ui_idle(),
@@ -104,20 +117,38 @@ UX_STEP_CB(ux_settings_flow_2_step,
                "Back",
            });
 
-UX_DEF(ux_settings_enabled_flow, &ux_settings_flow_1_enabled_step, &ux_settings_flow_2_step);
+UX_DEF(ux_settings_enabled_flow,
+       &ux_settings_flow_1_enabled_step,
+       &ux_settings_flow_client_pin_step,
+       &ux_settings_flow_2_step);
 
-UX_DEF(ux_settings_disabled_flow, &ux_settings_flow_1_disabled_step, &ux_settings_flow_2_step);
+UX_DEF(ux_settings_disabled_flow,
+       &ux_settings_flow_1_disabled_step,
+       &ux_settings_flow_client_pin_step,
+       &ux_settings_flow_2_step);
+
+static void display_settings_at(const ux_flow_step_t *step) {
+    const char *state = config_get_client_pin_advertised() ? "On (Android)" : "Off";
+    memcpy(g.buffer_20, state, strlen(state) + 1);
+    if (config_get_rk_enabled()) {
+        ux_flow_init(0, ux_settings_enabled_flow, step);
+    } else {
+        ux_flow_init(0, ux_settings_disabled_flow, step);
+    }
+}
 
 static void display_settings() {
-    if (config_get_rk_enabled()) {
-        ux_flow_init(0, ux_settings_enabled_flow, NULL);
-    } else {
-        ux_flow_init(0, ux_settings_disabled_flow, NULL);
-    }
+    display_settings_at(NULL);
+}
+
+static void toggle_client_pin() {
+    config_set_client_pin_advertised(!config_get_client_pin_advertised());
+    // Stay on this setting
+    display_settings_at(&ux_settings_flow_client_pin_step);
 }
 #endif  // ENABLE_RK_CONFIG_UI_SETTING
 
-UX_STEP_NOCB(ux_idle_flow_1_step, pn, {&C_icon_security_key, "Security Key"});
+UX_STEP_NOCB(ux_idle_flow_1_step, pn, {&C_icon_security_key, APPNAME});
 
 #ifndef TARGET_NANOS
 UX_STEP_NOCB(ux_idle_flow_2_step,
@@ -137,6 +168,22 @@ UX_STEP_NOCB(ux_idle_flow_3_step,
              {
                  "Version",
                  APPVERSION,
+             });
+//Credits
+UX_STEP_NOCB(ux_idle_flow_credits_step,
+             bn,
+             {
+                 "Reworked by",
+                 "My1",
+             });
+
+// Identifies the seed, to match backups of the resident credentials with this device
+// (rk_backup.py stores it in the backup file). Computed into g.buffer_20 by ui_idle().
+UX_STEP_NOCB(ux_idle_flow_backup_id_step,
+             bn,
+             {
+                 "Backup ID",
+                 g.buffer_20,
              });
 
 #ifdef ENABLE_RK_CONFIG_UI_SETTING
@@ -160,12 +207,17 @@ UX_FLOW(ux_idle_flow,
         &ux_idle_flow_1_step,
         &ux_idle_flow_2_step,
         &ux_idle_flow_3_step,
+        &ux_idle_flow_backup_id_step,
+        &ux_idle_flow_credits_step,
 #ifdef ENABLE_RK_CONFIG_UI_SETTING
         &ux_idle_flow_4_step,
 #endif  // ENABLE_RK_CONFIG_UI_SETTING
         &ux_idle_flow_5_step);
 
 void ui_idle(void) {
+    // g.buffer_20 is shared with the request screens: fill it every time the idle flow comes back
+    config_get_backup_id(g.buffer_20);
+
     // reserve a display stack slot if none yet
     if (G_ux.stack_count == 0) {
         ux_stack_push();

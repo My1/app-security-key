@@ -11,6 +11,8 @@ from fido2 import cbor
 from fido2.ctap import CtapError
 from fido2.ctap1 import ApduError
 from fido2.ctap2.base import Ctap2, args, AttestationResponse, AssertionResponse
+from fido2.ctap2.credman import CredentialManagement
+from fido2.ctap2.pin import ClientPin
 from fido2.hid import CTAPHID
 from fido2.hid import CtapHidDevice
 
@@ -337,5 +339,133 @@ class LedgerCtap2(Ctap2, LedgerCTAP):
         response = self.device.recv(ctap_hid_cmd)
 
         self.wait_for_return_on_dashboard()
+
+        self.parse_response(response)
+
+    def get_cm_token(self,
+                     pin: ClientPin,
+                     rp_id=None,
+                     *,
+                     navigation: Nav = Nav.USER_ACCEPT,
+                     check_screens: bool = False,
+                     compare_args=None,
+                     will_fail: bool = False) -> bytes:
+        """getPinUvAuthTokenUsingUvWithPermissions with the cm permission: the user approves the
+        credential management on the device (a refusal raises OPERATION_DENIED)."""
+        self.navigator._backend.get_current_screen_content()
+
+        key_agreement, shared_secret = pin._get_shared_secret()
+        # Let python-fido2 build the request, but only send it: the answer comes after the
+        # user's choice on the device
+        sent = []
+
+        def capture(cmd, data=None, **kwargs):
+            sent.append(self.send_cbor_nowait(cmd, data))
+            return {}
+
+        self.send_cbor = capture
+        try:
+            self.client_pin(pin.protocol.VERSION,
+                            ClientPin.CMD.GET_TOKEN_USING_UV,
+                            key_agreement=key_agreement,
+                            permissions=ClientPin.PERMISSION.CREDENTIAL_MGMT,
+                            permissions_rpid=rp_id)
+        finally:
+            del self.send_cbor
+        ctap_hid_cmd = sent[0]
+
+        text = None
+        nav_ins = None
+        val_ins: List[Union[NavIns, NavInsID]] = list()
+
+        if navigation is Nav.CLIENT_CANCEL:
+            check_screens = False
+        if will_fail:
+            # Fails before any user interaction (or can't be confirmed, over NFC)
+            navigation = Nav.NONE
+
+        if not self.nfc and navigation is not Nav.NONE:
+            if self.ledger_device.is_nano:
+                nav_ins = NavInsID.RIGHT_CLICK
+                val_ins = [NavInsID.BOTH_CLICK]
+                text = "Yes, allow" if navigation is Nav.USER_ACCEPT else "No, deny"
+            elif self.ledger_device.touchable:
+                if navigation is Nav.USER_ACCEPT:
+                    val_ins = [NavInsID.USE_CASE_CHOICE_CONFIRM]
+                else:
+                    val_ins = [NavInsID.USE_CASE_CHOICE_REJECT]
+
+        self.navigate(navigation, check_screens, compare_args, text, nav_ins, val_ins)
+
+        if navigation is Nav.CLIENT_CANCEL:
+            self.device.send(CTAPHID.CANCEL, b"")
+
+        response = self.device.recv(ctap_hid_cmd)
+
+        if navigation is not Nav.NONE:
+            self.wait_for_return_on_dashboard()
+
+        decoded = self.parse_response(response)
+        return pin.protocol.decrypt(shared_secret, decoded[ClientPin.RESULT.PIN_UV_TOKEN])
+
+    def delete_credential(self,
+                          credential_id,
+                          pin_uv_protocol,
+                          pin_uv_param,
+                          *,
+                          navigation: Nav = Nav.USER_ACCEPT,
+                          # if snapshots are checked against golden ones or not
+                          check_screens: bool = False,
+                          compare_args=None,
+                          will_fail: bool = False) -> None:
+        """authenticatorCredentialManagement deleteCredential: the user confirms on the device."""
+        # Refresh navigator screen content reference
+        self.navigator._backend.get_current_screen_content()
+
+        data = args(CredentialManagement.CMD.DELETE_CREDENTIAL,
+                    {CredentialManagement.PARAM.CREDENTIAL_ID: credential_id},
+                    pin_uv_protocol,
+                    pin_uv_param)
+        ctap_hid_cmd = self.send_cbor_nowait(Ctap2.CMD.CREDENTIAL_MGMT, data)
+
+        text = None
+        nav_ins = None
+        val_ins: List[Union[NavIns, NavInsID]] = list()
+
+        if navigation is Nav.CLIENT_CANCEL:
+            check_screens = False
+        if will_fail:
+            # Fails before any user interaction (or can't be confirmed, over NFC)
+            navigation = Nav.NONE
+
+        if not self.nfc and navigation is not Nav.NONE:
+            if self.ledger_device.is_nano:
+                nav_ins = NavInsID.RIGHT_CLICK
+                val_ins = [NavInsID.BOTH_CLICK]
+                if navigation is Nav.USER_ACCEPT:
+                    text = "Yes, delete"
+                else:
+                    text = "No, don't delete"
+            elif self.ledger_device.touchable:
+                if navigation is Nav.USER_ACCEPT:
+                    val_ins = [NavInsID.USE_CASE_CHOICE_CONFIRM]
+                else:
+                    val_ins = [NavInsID.USE_CASE_CHOICE_REJECT]
+
+        self.navigate(navigation,
+                      check_screens,
+                      compare_args,
+                      text,
+                      nav_ins,
+                      val_ins)
+
+        if navigation is Nav.CLIENT_CANCEL:
+            # Send a cancel command
+            self.device.send(CTAPHID.CANCEL, b"")
+
+        response = self.device.recv(ctap_hid_cmd)
+
+        if navigation is not Nav.NONE:
+            self.wait_for_return_on_dashboard()
 
         self.parse_response(response)

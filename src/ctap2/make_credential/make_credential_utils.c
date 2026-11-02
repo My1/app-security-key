@@ -164,6 +164,8 @@ static int build_makeCred_authData(uint8_t *nonce, uint8_t *buffer, uint32_t buf
     ctap2CredentailData.userStrLen = ctap2RegisterData->userStrLen;
     ctap2CredentailData.coseAlgorithm = ctap2RegisterData->coseAlgorithm;
     ctap2CredentailData.residentKey = ctap2RegisterData->residentKey;
+    ctap2CredentailData.rpId = ctap2RegisterData->rpId;
+    ctap2CredentailData.rpIdLen = ctap2RegisterData->rpIdLen;
     ctap2CredentailData.noCounter = 1;
     status = credential_wrap(ctap2RegisterData->rpIdHash,
                              nonce,

@@ -35,8 +35,11 @@ def test_u2f_fido2_proxy_get_info_raw(client):
 def test_u2f_fido2_proxy_wrong_p1p2(client):
     request = struct.pack(">B", Ctap2.CMD.GET_INFO)
 
-    # Only supported P1 is 0x00
+    # Supported P1 are 0x00 and 0x80 (0x80 is sent by some NFC readers / Android, accepted on
+    # every transport)
     for p1 in range(1, 0xff + 1):
+        if p1 == 0x80:
+            continue
         with pytest.raises(ApduError) as e:
             client.ctap1.send_apdu(cla=0x00,
                                    ins=0x10,

@@ -108,6 +108,12 @@ int config_init(void) {
         nvm_write((void *) &N_u2f.rk_enabled, (void *) &tmp8, sizeof(N_u2f.rk_enabled));
 #endif
 
+        // clientPin not advertised by default
+        tmp8 = 0;
+        nvm_write((void *) &N_u2f.client_pin_advertised,
+                  (void *) &tmp8,
+                  sizeof(N_u2f.client_pin_advertised));
+
         tmp8 = 1;
         nvm_write((void *) &N_u2f.initialized, (void *) &tmp8, sizeof(N_u2f.initialized));
     } else {
@@ -130,6 +136,27 @@ uint8_t config_increase_and_get_authentification_counter(uint8_t *buffer) {
     buffer[2] = ((counter >> 8) & 0xff);
     buffer[3] = (counter & 0xff);
     return 4;
+}
+
+void config_get_backup_id(char *out) {
+    static const char hexDigits[] = "0123456789abcdef";
+    // Domain separation: nothing else hashes the wrapping key with this prefix
+    static const char prefix[] = "ledger-my1-rk-backup-id";
+    uint8_t hash[CX_SHA256_SIZE];
+
+    // The first 4 bytes of SHA-256(prefix || wrappingKeyCTAP2): one way, it tells nothing about
+    // the key
+    crypto_compute_sha256((uint8_t *) prefix,
+                          sizeof(prefix) - 1,
+                          (uint8_t *) N_u2f.wrappingKeyCTAP2,
+                          sizeof(N_u2f.wrappingKeyCTAP2),
+                          hash);
+    for (uint8_t i = 0; i < 4; i++) {
+        out[2 * i] = hexDigits[hash[i] >> 4];
+        out[2 * i + 1] = hexDigits[hash[i] & 0x0F];
+    }
+    out[8] = '\0';
+    explicit_bzero(hash, sizeof(hash));
 }
 
 void config_process_ctap2_reset(void) {
@@ -180,6 +207,15 @@ void config_decrease_ctap2_pin_retry_counter(void) {
 void config_reset_ctap2_pin_retry_counter(void) {
     uint8_t tmp = CTAP2_PIN_RETRIES;
     nvm_write((void *) &N_u2f.pinRetries, (void *) &tmp, sizeof(N_u2f.pinRetries));
+}
+
+void config_set_client_pin_advertised(bool advertised) {
+    uint8_t tmp8 = advertised ? 1 : 0;
+    nvm_write((void *) &N_u2f.client_pin_advertised, (void *) &tmp8, sizeof(tmp8));
+}
+
+bool config_get_client_pin_advertised(void) {
+    return N_u2f.client_pin_advertised == 1;
 }
 
 #ifdef ENABLE_RK_CONFIG

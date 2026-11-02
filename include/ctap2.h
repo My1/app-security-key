@@ -100,8 +100,21 @@
 // pinUvAuthToken permissions (FIDO2.1 spec, section 6.5.5.7)
 #define PUAT_PERM_MC 0x01  // authenticatorMakeCredential
 #define PUAT_PERM_GA 0x02  // authenticatorGetAssertion
-// Permissions this authenticator can grant. cm / be / lbw / acfg are not implemented.
-#define PUAT_PERM_SUPPORTED (PUAT_PERM_MC | PUAT_PERM_GA)
+#define PUAT_PERM_CM 0x04  // authenticatorCredentialManagement
+// Permissions this authenticator can grant. be / lbw / acfg are not implemented.
+#define PUAT_PERM_SUPPORTED (PUAT_PERM_MC | PUAT_PERM_GA | PUAT_PERM_CM)
+
+#ifndef ERROR_PUAT_REQUIRED
+#define ERROR_PUAT_REQUIRED 0x36  // CTAP2_ERR_PUAT_REQUIRED
+#endif
+
+#ifndef ERROR_INVALID_SUBCOMMAND
+#define ERROR_INVALID_SUBCOMMAND 0x3E  // CTAP2_ERR_INVALID_SUBCOMMAND
+#endif
+
+#ifndef ERROR_USER_ACTION_TIMEOUT
+#define ERROR_USER_ACTION_TIMEOUT 0x2F  // CTAP2_ERR_USER_ACTION_TIMEOUT
+#endif
 
 #ifndef ERROR_UNAUTHORIZED_PERMISSION
 #define ERROR_UNAUTHORIZED_PERMISSION 0x40  // CTAP2_ERR_UNAUTHORIZED_PERMISSION
@@ -122,6 +135,36 @@ void ctap2_client_pin_handle(u2f_service_t *service, uint8_t *buffer, uint16_t l
 void ctap2_reset_handle(u2f_service_t *service, uint8_t *buffer, uint16_t length);
 
 void ctap2_client_pin_reset_ctx(void);
+
+// Resident keys can be turned on and off in the settings when ENABLE_RK_CONFIG is defined (the
+// caller includes config.h), they are always on otherwise.
+#ifdef ENABLE_RK_CONFIG
+#define CTAP2_RK_ENABLED() config_get_rk_enabled()
+#else
+#define CTAP2_RK_ENABLED() true
+#endif
+
+// RAM scratch shared by the PIN/UV crypto and credential management, never used at the same time.
+// Contents do not survive the command that fills them. It overlays the PIN/UV buffers (212 bytes),
+// so making it bigger than those costs RAM: client_pin.c checks it at build time.
+#define CTAP2_SHARED_SCRATCH_SIZE 204
+uint8_t *ctap2_shared_scratch(void);
+
+// authenticatorCredentialManagement (src/ctap2/cred_mgmt.c)
+// authenticatorCredentialManagement (vendorCommand false), or the vendor command 0x50: backup ID
+// and restore of the resident credentials (vendorCommand true). One function for both, without a
+// wrapper frame: the stack is tight on the Nano S.
+void ctap2_cred_mgmt_handle(u2f_service_t *service,
+                            uint8_t *buffer,
+                            uint16_t length,
+                            bool vendorCommand);
+void ctap2_cred_mgmt_reset_ctx(void);
+// Completion of a deleteCredential once the user has answered on the device
+void ctap2_cred_mgmt_delete_confirm(void);
+void ctap2_cred_mgmt_delete_cancel(void);
+// Forgets the pending delete without answering (the host cancelled, or the answer is sent by the
+// caller)
+void ctap2_cred_mgmt_delete_discard(void);
 
 /******************************************/
 /*       PIN Auth Protocol functions      */
@@ -173,6 +216,30 @@ bool ctap2_client_pin_protocol_supported(int protocol);
 
 // Removes a permission from the current pinUvAuthToken (no effect without a token).
 void ctap2_client_pin_clear_permission(uint8_t permission);
+
+// Verifies the pinUvAuthParam of an authenticatorCredentialManagement request against the current
+// pinUvAuthToken: msg || msg2 is authenticated (subCommand, then the raw subCommandParams, either
+// may be empty), the token must carry the cm permission and, when it is bound to an RP ID and
+// `rpIdHash` is not NULL, they must match. The cm permission is not consumed.
+// Returns ERROR_NONE on success, ERROR_PIN_AUTH_INVALID otherwise.
+int ctap2_client_pin_verify_cm(int protocol,
+                               const uint8_t *msg,
+                               uint32_t msgLength,
+                               const uint8_t *msg2,
+                               uint32_t msg2Length,
+                               const uint8_t *signature,
+                               uint32_t signatureLength,
+                               const uint8_t *rpIdHash);
+
+// A pinUvAuthToken with the cm permission is only issued once the user approved it on the device
+// (the token is prepared by getPinUvAuthTokenUsingUvWithPermissions, which then waits for it).
+void ctap2_client_pin_cm_auth_confirm(void);
+void ctap2_client_pin_cm_auth_cancel(void);
+// Same as cancel, without answering (the host cancelled)
+void ctap2_client_pin_cm_auth_discard(void);
+
+// True if the current pinUvAuthToken is not bound to an RP ID, or bound to this one.
+bool ctap2_client_pin_token_allows_rp(const uint8_t *rpIdHash);
 
 // Verifies a pinUvAuthParam against the current pinUvAuthToken.
 //

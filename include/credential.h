@@ -84,6 +84,10 @@ typedef struct credential_data_s {
     char *userStr;
     uint32_t userStrLen;
     uint8_t residentKey;
+    // RP ID, only stored inside the full encoding of resident credentials (so that credential
+    // management can name the RP), when it fits in an RK slot. NULL when unknown.
+    char *rpId;
+    uint32_t rpIdLen;
     // Set on credentials that never report a signature counter (always 0). Only credentials with
     // handle version 2 can carry it, older (version 1) credentials always use the counter.
     uint8_t noCounter;
@@ -157,6 +161,12 @@ int credential_extract(const uint8_t *rpIdHash,
                        uint8_t **nonce,
                        uint8_t **encodedCredential,
                        uint32_t *encodedCredentialLen);
+
+/**
+ * Encode the full form of a resident credential, as stored in the rk storage (with its RP ID
+ * when it fits in a slot). Returns its length, < 0 on error.
+ */
+int credential_encode_resident(credential_data_t *credData, uint8_t *buffer, uint32_t bufferLen);
 
 /**
  * Decode credential from CBOR encoded form into credData form

@@ -1,7 +1,4 @@
 from fido2.ctap2.base import Ctap2, Info
-from hashlib import sha256
-from ledgered.devices import DeviceType
-
 
 from ..utils import ENABLE_RK_CONFIG
 
@@ -19,7 +16,8 @@ def test_get_info_version(client):
 
     assert "U2F_V2" in info.versions
     assert "FIDO_2_0" in info.versions
-    assert len(info.versions) == 2
+    # "FIDO_2_1" is advertised when the app is built with it (Android needs it)
+    assert set(info.versions) <= {"U2F_V2", "FIDO_2_0", "FIDO_2_1"}
 
 
 def test_get_info_extensions(client):
@@ -30,23 +28,9 @@ def test_get_info_extensions(client):
 
 
 def test_get_info_aaguid(client):
+    # This app is not Ledger's: it has its own AAGUID, the same on every device
     info = client.ctap2.info
-
-    expected_base_string = {
-        DeviceType.NANOS: "Ledger FIDO 2 1.0",
-        DeviceType.NANOX: "Ledger FIDO 2 1.0 NanoX",
-        DeviceType.NANOSP: "Ledger FIDO 2 1.0 NanoS+",
-        DeviceType.STAX: "Ledger FIDO 2 1.0 Stax",
-        DeviceType.FLEX: "Ledger FIDO 2 1.0 Flex",
-        DeviceType.APEX_P: "Ledger FIDO 2 1.0 Apex_P"
-    }
-    if client.ledger_device.type not in expected_base_string:
-        raise ValueError("Unhandled model")
-
-    base_string = expected_base_string[client.ledger_device.type]
-    hs = sha256(base_string.encode('utf-8')).hexdigest()
-    hs = hs[:32]  # Keep only the 16 first bytes
-    assert hs == info.aaguid.hex()
+    assert info.aaguid.hex() == "c45922b4256a4ce680a537bce7ab79f5"
 
 
 def test_get_info_options(client):
@@ -61,14 +45,23 @@ def test_get_info_options(client):
     assert info.options["up"]
 
     # There is no FIDO client PIN: the device unlock PIN is the built-in user verification.
-    # "clientPin" is advertised only when built with PUAT_ADVERTISE_CLIENT_PIN (needed by Android)
+    # "clientPin" is only advertised when turned on in the settings (needed by Android), it is off
+    # by default
     assert info.options["uv"]
     assert info.options["pinUvAuthToken"]
 
     # Default value options
     assert not info.options["plat"]
 
-    assert len(info.options) == 5
+    assert "clientPin" not in info.options
+
+    # Vendor option: resident credential restore, always listed, usable while resident keys are
+    assert info.options["ledgerMy1RkRestore"] == info.options["rk"]
+
+    # clientPin (needed by Android) and credMgmt (while resident keys are enabled) are optional
+    assert set(info.options) - {"clientPin", "credMgmt"} == {"rk", "up", "uv", "plat",
+                                                             "pinUvAuthToken",
+                                                             "ledgerMy1RkRestore"}
 
 
 def test_get_info_max_msg_size(client):

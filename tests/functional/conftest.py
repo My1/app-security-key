@@ -28,6 +28,10 @@ def pytest_addoption(parser):
                      help="Enable RK UI configuration")
     parser.addoption("--u2f-over-fake-nfc", action="store_true", default=False,
                      help="Enable U2F tests over fake NFC")
+    parser.addoption("--soft-screens", action="store_true", default=False,
+                     help="Screens that differ from the golden snapshots (or have none) don't "
+                          "fail the test: it is reported as SCREENS (purple) instead of PASSED "
+                          "when everything else works, to see what a --golden_run would change")
 
 
 @pytest.fixture(scope="session")
@@ -164,6 +168,65 @@ def skip_by_devices(request, device: Device):
             devices = [devices]
         if (device.type in devices):
             pytest.skip('skipped on this device: {}'.format(device.name))
+
+
+@pytest.fixture(autouse=True)
+def soft_screen_comparison(request, monkeypatch):
+    """With --soft-screens, a screen that differs from its golden snapshot is recorded instead of
+    failing the test (see pytest_runtest_makereport / pytest_report_teststatus below)."""
+    request.node.screen_mismatches = []
+    if not request.config.getoption("soft_screens"):
+        return
+    if "navigator" not in request.fixturenames:
+        return
+    navigator = request.getfixturevalue("navigator")
+
+    def soft_compare(snaps_tmp_path, snaps_golden_path, index):
+        golden = navigator._get_snap_path(snaps_golden_path, index)
+        tmp = navigator._get_snap_path(snaps_tmp_path, index)
+        try:
+            same = navigator._backend.compare_screen_with_snapshot(
+                golden, tmp_snap_path=tmp, golden_run=navigator._golden_run)
+        except (FileNotFoundError, OSError):
+            same = False  # no golden snapshot yet (the screen is saved in snapshots-tmp)
+        if not same:
+            request.node.screen_mismatches.append(str(tmp))
+
+    def lenient_golden_dir(path, test_case_name, is_golden):
+        # Tests without golden snapshots yet must not fail on the missing directory
+        dir_path = navigator._get_snaps_dir_path(path, test_case_name, is_golden)
+        if navigator._golden_run and not dir_path.is_dir():
+            dir_path.mkdir(parents=True)
+        return dir_path
+
+    monkeypatch.setattr(navigator, "_compare_snap", soft_compare)
+    monkeypatch.setattr(navigator, "_check_snaps_dir_path", lenient_golden_dir)
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    outcome = yield
+    report = outcome.get_result()
+    if report.when == "call" and report.passed and getattr(item, "screen_mismatches", None):
+        report.screen_mismatches = list(item.screen_mismatches)
+
+
+def pytest_report_teststatus(report, config):
+    if report.when == "call" and getattr(report, "screen_mismatches", None):
+        return "screens", "V", ("SCREENS", {"purple": True})
+    return None
+
+
+def pytest_terminal_summary(terminalreporter, exitstatus, config):
+    reports = terminalreporter.stats.get("screens", [])
+    if not reports:
+        return
+    terminalreporter.section("screens differing from the golden snapshots", purple=True)
+    for report in reports:
+        terminalreporter.write_line(f"{report.nodeid}: {len(report.screen_mismatches)} screen(s)",
+                                    purple=True)
+        for path in report.screen_mismatches:
+            terminalreporter.write_line(f"    {path}")
 
 
 @pytest.fixture(autouse=True)
